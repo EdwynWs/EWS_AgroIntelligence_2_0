@@ -1,0 +1,573 @@
+From f31cadb83fc6354240f801676debd0669f1ab03f Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 05:38:27 +0200
+Subject: [PATCH 1/4] feat: add tenant-scoped employee workflows and automation
+ backend
+
+---
+ apps/api/src/app.ts                           |  18 +--
+ apps/api/src/automation-core.ts               |  80 +++++++++++++
+ apps/api/src/automation-routes.ts             | 106 ++++++++++++++++++
+ apps/api/src/fastify-transport.ts             |   7 ++
+ apps/api/src/safe-source.ts                   |  25 +++++
+ apps/api/src/scheduled-reports.ts             |  70 ++++++++++++
+ apps/api/src/server.ts                        |   4 +-
+ apps/worker/automation.ts                     |  22 ++++
+ apps/worker/index.ts                          |   9 +-
+ packages/database/migrate.ts                  |   7 +-
+ .../database/migrations/002_automation.sql    |  14 +++
+ packages/shared/resources.ts                  |   2 +-
+ scripts/seed.ts                               |   2 +-
+ scripts/tenant-data.ts                        |   4 +-
+ 14 files changed, 353 insertions(+), 17 deletions(-)
+ create mode 100644 apps/api/src/automation-core.ts
+ create mode 100644 apps/api/src/automation-routes.ts
+ create mode 100644 apps/api/src/fastify-transport.ts
+ create mode 100644 apps/api/src/safe-source.ts
+ create mode 100644 apps/api/src/scheduled-reports.ts
+ create mode 100644 apps/worker/automation.ts
+ create mode 100644 packages/database/migrations/002_automation.sql
+
+diff --git a/apps/api/src/app.ts b/apps/api/src/app.ts
+index f5b8af8..9164a56 100644
+--- a/apps/api/src/app.ts
++++ b/apps/api/src/app.ts
+@@ -1,3 +1,4 @@
++import { registerAutomationRoutes } from './automation-routes.ts';
+ import { z } from 'zod';
+ import { randomBytes, createHmac } from 'node:crypto';
+ import { one, insert, update } from '../../../packages/database/db.ts';
+@@ -11,8 +12,8 @@ import { executivePdf } from './pdf.ts';
+ import { seedDemo } from '../../../scripts/seed.ts';
+ export type Request={method:string;url:string;headers:Record<string,string|undefined>;body?:any;ip?:string};
+ export type Result={status:number;headers:Record<string,string>;body:any};
+-type Context={request:Request;body:any;query:Row;params:Row;user:Row|null;session:Row|null;tenant:string|null;ent:Row|null;headers:Record<string,string>};
+-type Route={method:string;path:string;regex:RegExp;keys:string[];public?:boolean;handler:(c:Context)=>Promise<any>};
++export type Context={request:Request;body:any;query:Row;params:Row;user:Row|null;session:Row|null;tenant:string|null;ent:Row|null;headers:Record<string,string>};
++export type Route={method:string;path:string;regex:RegExp;keys:string[];public?:boolean;handler:(c:Context)=>Promise<any>};
+ export function createApp(db:Database){
+  const routes:Route[]=[];const limits=new Map<string,{count:number;until:number}>();
+  const origin=process.env.APP_ORIGIN||'http://localhost:3000';
+@@ -29,7 +30,7 @@ export function createApp(db:Database){
+  route('POST','/api/public/leads',async c=>{const data=z.object({name:z.string().trim().min(2).max(150),company:z.string().trim().min(2).max(150),email:z.string().email().max(250),phone:z.string().min(8).max(30),message:z.string().max(2000),consent:z.literal(true)}).strict().parse(c.body);await insert(db,'leads',{id:uid(),...data,consent:1,status:'new',created_at:now()});return {message:'Solicitação registrada. A EWS Tech poderá entrar em contato pelos dados informados.'};},true);
+  route('POST','/api/auth/login',async c=>{
+   const data=z.object({email:z.string().email().max(250),password:z.string().max(128),code:z.string().max(6).optional()}).parse(c.body);
+-  const user=await one(db,'SELECT * FROM users WHERE email=? AND active=1',[data.email.toLowerCase()]);
++  const user=await one(db,'SELECT * FROM users WHERE email=? AND active=1',[data.email.toLowerCase()]);if(user?.access_profile==='OPERATOR')user.role='OPERATOR';
+   // A fixed expensive hash equalizes the missing-user path without storing a login secret.
+   const dummy='00000000000000000000000000000000:'+ '00'.repeat(64);
+   if(!passwordCheck(data.password,user?.password_hash||dummy)||!user)fail(401,'E-mail, senha ou código inválidos.');
+@@ -72,10 +73,10 @@ export function createApp(db:Database){
+  route('POST','/api/import/:name',async c=>{const name=c.params.name;if(!['energy_readings','production','costs'].includes(name))fail(400,'Importação não disponível para este recurso.');const e=await entitled(c);authorize(c.user!,e,name,true);const payload=z.object({csv:z.string().max(2000000).optional(),xlsx:z.string().max(2000000).optional()}).strict().refine(v=>!!v.csv!==!!v.xlsx,'Envie CSV ou XLSX.').parse(c.body);let csv=payload.csv;try{if(payload.xlsx)csv=await xlsxToCsv(payload.xlsx);}catch(e:any){fail(400,e.message);}const rows=parseCsv(csv!);if(!rows.length)fail(400,'Arquivo sem registros.');const d=resources[name];return db.transaction(async tx=>{let count=0;for(const row of rows){const values:Row={};for(const [k,v]of Object.entries(row)){const f=d.fields[k];if(!f)fail(400,`Coluna desconhecida: ${k}`);values[k]=f.type==='number'?Number(v):v||null;}if(d.fields.source)values.source=e.demo?'MANUAL':'IMPORTED';try{await saveResource(tx,c.user!,tenant(c),e,name,values);count++;}catch(err:any){fail(400,`Linha ${count+2}: ${err.message}`);}}return {imported:count};});});
+  route('GET','/api/export/:name',async c=>{const name=c.params.name;authorize(c.user!,await entitled(c),name);const rows=await db.query(`SELECT * FROM ${name} WHERE tenant_id=? ORDER BY created_at DESC LIMIT 10000`,[tenant(c)]);c.headers['content-type']='text/csv; charset=utf-8';c.headers['content-disposition']=`attachment; filename="${name}.csv"`;return toCsv(rows);});
+  route('GET','/api/report',async c=>{const data=await dashboard(db,tenant(c),c.query);c.headers['content-type']='text/html; charset=utf-8';return reportHtml(data);});
+- route('GET','/api/users',async c=>{await entitled(c);if(!['EWS','OWNER','MANAGER'].includes(c.user!.role))fail(403,'Acesso restrito.');return {items:await db.query('SELECT id,name,email,role,active,mfa_enabled,created_at FROM users WHERE tenant_id=? ORDER BY name',[tenant(c)])};});
+- route('POST','/api/users',async c=>{const e=await entitled(c);if(!['EWS','OWNER'].includes(c.user!.role))fail(403,'Somente o administrador pode criar usuários.');const x=adminFields(c.body);return db.transaction(async tx=>{const n=await one(tx,'SELECT COUNT(*) AS n FROM users WHERE tenant_id=?',[tenant(c)]);if(Number(n.n)>=e.user_limit)fail(409,'Limite de usuários atingido.');const id=uid();await insert(tx,'users',{id,tenant_id:tenant(c),name:x.name,role:x.role,email:x.email.toLowerCase(),password_hash:passwordHash(x.password),active:1,mfa_secret:null,mfa_enabled:0,mfa_last_step:-1,created_at:now()});return {id};});});
++ route('GET','/api/users',async c=>{await entitled(c);if(!['EWS','OWNER','MANAGER'].includes(c.user!.role))fail(403,'Acesso restrito.');return {items:await db.query("SELECT id,name,email,CASE WHEN access_profile='OPERATOR' THEN 'OPERATOR' ELSE role END AS role,active,mfa_enabled,created_at FROM users WHERE tenant_id=? ORDER BY name",[tenant(c)])};});
++ route('POST','/api/users',async c=>{const e=await entitled(c);if(!['EWS','OWNER'].includes(c.user!.role))fail(403,'Somente o administrador pode criar usuários.');const x=adminFields(c.body);return db.transaction(async tx=>{const n=await one(tx,'SELECT COUNT(*) AS n FROM users WHERE tenant_id=?',[tenant(c)]);if(Number(n.n)>=e.user_limit)fail(409,'Limite de usuários atingido.');const id=uid();await insert(tx,'users',{id,tenant_id:tenant(c),name:x.name,role:x.role==='OPERATOR'?'VIEWER':x.role,access_profile:x.role==='OPERATOR'?'OPERATOR':'',email:x.email.toLowerCase(),password_hash:passwordHash(x.password),active:1,mfa_secret:null,mfa_enabled:0,mfa_last_step:-1,created_at:now()});return {id};});});
+  route('POST','/api/users/:id/invite',async c=>{await entitled(c);if(!['EWS','OWNER'].includes(c.user!.role))fail(403,'Somente o administrador pode convidar.');if(!process.env.SMTP_HOST)fail(503,'Configure o SMTP para enviar convites.');const u=await one(db,'SELECT id,email FROM users WHERE id=? AND tenant_id=?',[c.params.id,tenant(c)]);if(!u)fail(404,'Usuário não encontrado.');const t=token();await db.transaction(async tx=>{await insert(tx,'auth_tokens',{id:hash(t),user_id:u.id,kind:'invite',expires_at:new Date(Date.now()+86400000).toISOString(),used_at:null});await insert(tx,'outbox',{id:uid(),tenant_id:tenant(c),recipient:u.email,subject:'Seu convite · EWS AgroIntelligence',body:`Defina sua senha em ${origin}/reset#token=${t}`,status:'pending',attempts:0,next_attempt_at:now(),created_at:now()});});return {message:'Convite colocado na fila de envio.'};});
+- route('POST','/api/users/:id/access',async c=>{await entitled(c);if(!['EWS','OWNER'].includes(c.user!.role))fail(403,'Somente o administrador pode alterar acesso.');if(c.params.id===c.user!.id)fail(409,'Não altere seu próprio acesso por esta operação.');const x=z.object({active:z.number().int().min(0).max(1),role:z.enum(roles as [string,...string[]])}).parse(c.body);await db.transaction(async tx=>{await update(tx,'users',x,'id=? AND tenant_id=?',[c.params.id,tenant(c)]);await tx.query('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND tenant_id=?)',[c.params.id,tenant(c)]);await audit(tx,c.user,c.tenant,'access_changed','users',c.params.id,x);});return {ok:true};});
++ route('POST','/api/users/:id/access',async c=>{await entitled(c);if(!['EWS','OWNER'].includes(c.user!.role))fail(403,'Somente o administrador pode alterar acesso.');if(c.params.id===c.user!.id)fail(409,'Não altere seu próprio acesso por esta operação.');const x=z.object({active:z.number().int().min(0).max(1),role:z.enum(roles as [string,...string[]])}).parse(c.body);await db.transaction(async tx=>{await update(tx,'users',{...x,role:x.role==='OPERATOR'?'VIEWER':x.role,access_profile:x.role==='OPERATOR'?'OPERATOR':''},'id=? AND tenant_id=?',[c.params.id,tenant(c)]);await tx.query('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND tenant_id=?)',[c.params.id,tenant(c)]);await audit(tx,c.user,c.tenant,'access_changed','users',c.params.id,x);});return {ok:true};});
+  route('GET','/api/settings',async c=>({tenant:await one(db,'SELECT * FROM tenants WHERE id=?',[tenant(c)]),smtp:{configured:!!process.env.SMTP_HOST},billing:{mode:'manual',provider_configured:false},industrial:{mode:'read-only',adapter:'simulator',omron_validated:false},retention_days:Number(process.env.TELEMETRY_RETENTION_DAYS||90)}));
+  route('PUT','/api/settings',async c=>{if(!['EWS','OWNER'].includes(c.user!.role))fail(403,'Somente o administrador pode configurar.');const data=z.object({name:z.string().min(2).max(150),timezone:z.string().max(100).refine(v=>{try{new Intl.DateTimeFormat('pt-BR',{timeZone:v});return true;}catch{return false;}},'Fuso inválido')}).parse(c.body);await update(db,'tenants',data,'id=?',[tenant(c)]);return {ok:true};});
+  route('GET','/api/admin/overview',async c=>{requireEws(c);const rows=await db.query('SELECT s.*,t.name,t.demo,p.name as plan,p.price_cents FROM subscriptions s JOIN tenants t ON t.id=s.tenant_id JOIN plans p ON p.id=s.plan_id WHERE t.demo=0 ORDER BY s.started_at DESC');const money=await one(db,"SELECT SUM(CASE WHEN c.status<>'void' THEN c.amount_cents ELSE 0 END) AS billed,SUM(CASE WHEN c.status='paid' THEN c.amount_cents ELSE 0 END) AS paid,SUM(CASE WHEN c.status='pending' AND c.due_on<? THEN c.amount_cents ELSE 0 END) AS overdue FROM charges c JOIN tenants t ON t.id=c.tenant_id WHERE t.demo=0",[now().slice(0,10)]);const mrr=rows.filter(s=>s.status==='active').reduce((s,x)=>s+Number(x.price_cents),0);return {items:rows,mrr_cents:mrr,arr_cents:mrr*12,active:rows.filter(x=>x.status==='active').length,trial:rows.filter(x=>x.status==='trial').length,suspended:rows.filter(x=>x.status==='suspended').length,cancelled:rows.filter(x=>x.status==='cancelled').length,billed_cents:Number(money.billed||0),paid_cents:Number(money.paid||0),overdue_cents:Number(money.overdue||0)};});
+@@ -101,11 +102,12 @@ export function createApp(db:Database){
+  route('POST','/api/attachments/:order',async c=>{authorize(c.user!,await entitled(c),'work_orders',true);const x=z.object({name:z.string().min(1).max(150),media_type:z.enum(['application/pdf','image/png','image/jpeg','text/plain']),content_base64:z.string().max(2000000)}).strict().parse(c.body);const bytes=Buffer.from(x.content_base64,'base64');if(bytes.length>1500000||!bytes.length)fail(400,'Arquivo vazio ou maior que 1,5 MB.');const signatures:Row={'application/pdf':bytes.subarray(0,5).toString()==='%PDF-','image/png':bytes.subarray(0,8).toString('hex')==='89504e470d0a1a0a','image/jpeg':bytes[0]===255&&bytes[1]===216,'text/plain':!bytes.includes(0)};if(!signatures[x.media_type])fail(400,'Conteúdo incompatível com o tipo informado.');const id=uid();await db.transaction(async tx=>{if(!await one(tx,'SELECT id FROM work_orders WHERE tenant_id=? AND id=?',[tenant(c),c.params.order]))fail(404,'Ordem não encontrada.');const count=await one(tx,'SELECT COUNT(*) AS n FROM attachments WHERE tenant_id=? AND work_order_id=?',[tenant(c),c.params.order]);if(Number(count.n)>=10)fail(409,'Máximo de 10 anexos por ordem.');await insert(tx,'attachments',{id,tenant_id:tenant(c),work_order_id:c.params.order,...x,size_bytes:bytes.length,created_at:now()});await audit(tx,c.user,c.tenant,'attachment_created','attachments',id);});return {id};});
+  route('GET','/api/attachment/:id/download',async c=>{authorize(c.user!,await entitled(c),'work_orders');const a=await one(db,'SELECT * FROM attachments WHERE tenant_id=? AND id=?',[tenant(c),c.params.id]);if(!a)fail(404,'Anexo não encontrado.');c.headers['content-type']=a.media_type;c.headers['content-disposition']='attachment; filename="'+a.name.replace(/[^a-zA-Z0-9._-]/g,'_')+'"';c.headers['content-security-policy']="default-src 'none'; sandbox";return Buffer.from(a.content_base64,'base64');});
+  route('POST','/api/billing/webhook',async c=>{if(process.env.ENABLE_BILLING_WEBHOOK!=='true'||!process.env.WEBHOOK_SECRET)fail(503,'Provedor de cobrança não configurado.');const timestamp=c.request.headers['x-ews-timestamp']||'';if(!/^\d{13}$/.test(timestamp)||Math.abs(Date.now()-Number(timestamp))>300000)fail(401,'Timestamp de webhook inválido.');const raw=JSON.stringify(c.body);const signature=createHmac('sha256',process.env.WEBHOOK_SECRET!).update(timestamp+'.'+raw).digest('hex');if(!safeEqual(signature,c.request.headers['x-ews-signature']||''))fail(401,'Assinatura inválida.');const x=z.object({id:z.string().min(1).max(150),charge_id:z.string().uuid(),status:z.literal('paid'),reference:z.string().min(1).max(250),paid_at:z.string().datetime()}).strict().parse(c.body);return db.transaction(async tx=>{const old=await one(tx,'SELECT payload_hash FROM billing_events WHERE id=?',[x.id]);if(old){if(old.payload_hash!==hash(raw))fail(409,'Evento reutilizado com conteúdo diferente.');return {duplicate:true};}const charge=await one(tx,'SELECT * FROM charges WHERE id=?',[x.charge_id]);if(!charge||charge.status==='void')fail(400,'Cobrança inválida.');if(charge.status==='pending')await update(tx,'charges',{status:'paid',paid_at:x.paid_at,reference:x.reference},'id=?',[charge.id]);await insert(tx,'billing_events',{id:x.id,provider:'custom-hmac',payload_hash:hash(raw),created_at:now()});await audit(tx,null,charge.tenant_id,'payment_webhook','charges',charge.id);return {accepted:true};});},true);
++ registerAutomationRoutes(db,route);
+  async function dispatch(request:Request):Promise<Result>{
+   const headers:Record<string,string>={'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'no-referrer'};
+   try{
+    const url=new URL(request.url,'http://localhost');const route=routes.find(r=>r.method===request.method&&r.regex.test(url.pathname));if(!route)fail(404,'Rota não encontrada.');
+-   const isMachine=['/api/ingest','/api/billing/webhook'].includes(url.pathname);
++   const isMachine=['/api/ingest','/api/billing/webhook','/api/import-feed'].includes(url.pathname);
+    const key=(isMachine?hash(request.headers.authorization||request.ip||'unknown'):request.ip||'local')+':'+(url.pathname.startsWith('/api/auth/')?'auth':isMachine?'ingest':'api');
+    if(limits.size>10000){for(const [k,v]of limits)if(v.until<Date.now())limits.delete(k);if(limits.size>10000)fail(503,'Tente novamente em instantes.');}
+    let bucket=limits.get(key);if(!bucket||bucket.until<Date.now()){bucket={count:0,until:Date.now()+60000};limits.set(key,bucket);}bucket.count++;if(bucket.count>(key.endsWith(':auth')?30:key.endsWith(':ingest')?120:600))fail(429,'Limite de requisições atingido. Aguarde um minuto.');
+@@ -118,6 +120,8 @@ export function createApp(db:Database){
+     if(!raw)fail(401,'Entre na sua conta.');
+     const s=await one(db,'SELECT * FROM sessions WHERE id=? AND expires_at>?',[hash(raw!),now()]);if(!s)fail(401,'Sessão expirada. Entre novamente.');
+     const user=await one(db,'SELECT * FROM users WHERE id=? AND active=1',[s.user_id]);if(!user)fail(401,'Usuário inativo.');
++    if(user.access_profile==='OPERATOR')user.role='OPERATOR';
++    if(user.role==='OPERATOR'&&!(['/api/auth/me','/api/auth/logout','/api/auth/password','/api/auth/mfa/setup','/api/auth/mfa/confirm','/api/staff','/api/staff/production','/api/staff/incidents','/api/staff/preference'].includes(url.pathname)))fail(403,'Perfil operador restrito ao Modo Funcionário.');
+     c.user=user;c.session=s;c.tenant=user.tenant_id;
+     if(user.role==='EWS'&&request.headers['x-tenant-id']){const t=await one(db,'SELECT id FROM tenants WHERE id=?',[request.headers['x-tenant-id']]);if(!t)fail(404,'Empresa não encontrada.');c.tenant=t.id;}
+     if(mutation&&!safeEqual(request.headers['x-csrf-token']||'',s.csrf))fail(403,'Proteção CSRF: atualize a sessão e tente novamente.');
+diff --git a/apps/api/src/automation-core.ts b/apps/api/src/automation-core.ts
+new file mode 100644
+index 0000000..93bb4f4
+--- /dev/null
++++ b/apps/api/src/automation-core.ts
+@@ -0,0 +1,80 @@
++import {one,insert,update} from '../../../packages/database/db.ts';
++import type {Database,Queryable,Row} from '../../../packages/database/db.ts';
++import {fail,uid,now,entitlement,saveResource,audit} from './domain.ts';
++import {hash} from './security.ts';
++import {resources,validate} from '../../../packages/shared/resources.ts';
++import {parseCsv} from '../../../packages/shared/calculations.ts';
++import {xlsxToCsv} from './imports.ts';
++
++export function localClock(timezone:string,at=new Date()){
++ const p=new Intl.DateTimeFormat('en-CA',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(at);
++ const get=(key:string)=>p.find(v=>v.type===key)!.value;
++ return {day:`${get('year')}-${get('month')}-${get('day')}`,time:`${get('hour')}:${get('minute')}`};
++}
++export async function lease(db:Database,key:string,work:()=>Promise<any>){
++ const owner=uid(),time=now();await db.query('INSERT INTO job_leases(id,owner,expires_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE job_leases.expires_at<?',[key,owner,new Date(Date.now()+600000).toISOString(),time]);
++ if((await one(db,'SELECT owner FROM job_leases WHERE id=?',[key]))?.owner!==owner)return {busy:true};
++ try{return await work();}finally{await db.query('DELETE FROM job_leases WHERE id=? AND owner=?',[key,owner]);}
++}
++export async function population(db:Queryable,tenant:string,barn:string,day:string){
++ return one(db,'SELECT * FROM population_records WHERE tenant_id=? AND barn_id=? AND day<=? ORDER BY day DESC LIMIT 1',[tenant,barn,day]);
++}
++export async function recordPopulation(db:Queryable,tenant:string,row:Row,source:string){
++ const barn=await one(db,'SELECT * FROM barns WHERE tenant_id=? AND id=?',[tenant,row.barn_id]);
++ const t=await one(db,'SELECT timezone FROM tenants WHERE id=?',[tenant]);
++ if(!barn||!Number.isInteger(row.birds)||row.birds<=0||row.birds>barn.capacity||!/^\d{4}-\d{2}-\d{2}$/.test(row.day)||isNaN(Date.parse(row.day))||new Date(row.day).toISOString().slice(0,10)!==row.day||row.day>localClock(t.timezone).day)fail(400,'População, data ou galpão inválidos.');
++ const old=await one(db,'SELECT * FROM population_records WHERE tenant_id=? AND barn_id=? AND day=?',[tenant,row.barn_id,row.day]);
++ if(old){if(Number(old.birds)===row.birds)return false;fail(409,'Já existe população diferente para esta data. Revise o lançamento.');}
++ await insert(db,'population_records',{id:uid(),tenant_id:tenant,barn_id:row.barn_id,day:row.day,birds:row.birds,source,created_at:now()});
++ const latest=await population(db,tenant,barn.id,localClock(t.timezone).day);
++ await update(db,'barns',{birds:latest.birds},'tenant_id=? AND id=?',[tenant,barn.id]);return true;
++}
++export async function inputRows(payload:Row,format:string):Promise<Row[]>{
++ if(payload.rows){if(!Array.isArray(payload.rows)||!payload.rows.length||payload.rows.length>1000||JSON.stringify(payload.rows).length>1500000)fail(400,'Envie de 1 a 1.000 registros, até 1,5 MB.');return payload.rows;}
++ try{const csv=format==='xlsx'?await xlsxToCsv(String(payload.content||'')):String(payload.content||'');if(csv.length>1500000)fail(400,'Arquivo excede 1,5 MB.');const rows=parseCsv(csv);if(!rows.length)fail(400,'Arquivo vazio.');return rows;}catch(e:any){return fail(400,e.message);}
++}
++const canonical=(value:Row)=>JSON.stringify(Object.fromEntries(Object.keys(value).sort().map(k=>[k,value[k]])));
++class Preview extends Error { result:Row;constructor(result:Row){super('preview');this.result=result;} }
++export async function runImport(db:Database,source:Row,payload:Row,preview=false,actor:Row|null=null){
++ return lease(db,'import:'+source.id,async()=>{
++ const id=uid(),fingerprint=hash(JSON.stringify(payload));
++ if(!preview)await insert(db,'import_runs',{id,tenant_id:source.tenant_id,source_id:source.id,fingerprint,status:'running',payload:JSON.stringify(payload),started_at:now()});
++ try{
++ const rows=await inputRows(payload,source.format),mapping=JSON.parse(source.mapping);
++ const result=await db.transaction(async tx=>{
++  const ent=await entitlement(tx,source.tenant_id);const fresh=await one(tx,'SELECT active FROM integration_sources WHERE id=? AND tenant_id=?',[source.id,source.tenant_id]);if(!fresh?.active)fail(409,'Integração desativada.');
++  let accepted=0,duplicates=0;
++  for(let i=0;i<rows.length;i++){
++   try{
++    const mapped:Row={};for(const [dest,column]of Object.entries(mapping)){if(!Object.hasOwn(rows[i],String(column)))fail(400,`Coluna ausente: ${column}`);mapped[dest]=rows[i][String(column)];}
++    if(source.resource==='birds')mapped.birds=Number(mapped.birds);else for(const [key,field]of Object.entries(resources[source.resource].fields)){if(mapped[key]===''&&!field.required)delete mapped[key];if(mapped[key]!==undefined&&field.type==='number')mapped[key]=Number(mapped[key]);}
++    if(mapped.day&&/^\d+(\.\d+)?$/.test(String(mapped.day)))mapped.day=new Date(Date.UTC(1899,11,30)+Number(mapped.day)*86400000).toISOString().slice(0,10);
++    const recordHash=hash(canonical(mapped));
++    if(await one(tx,'SELECT id FROM imported_records WHERE source_id=? AND fingerprint=?',[source.id,recordHash])){duplicates++;continue;}
++    if(source.resource==='birds'){
++     if(!ent.modules.includes('performance'))fail(403,'Performance não incluído.');
++     if(await recordPopulation(tx,source.tenant_id,mapped,ent.demo?'SIMULATED':'IMPORTED'))accepted++;else duplicates++;
++    }else{
++     if(['production','energy_readings'].includes(source.resource))mapped.source='IMPORTED';
++     if(source.resource==='production'&&mapped.birds===undefined){const p=await population(tx,source.tenant_id,mapped.barn_id,mapped.day);if(!p||Date.parse(mapped.day)-Date.parse(p.day)>30*86400000)fail(400,'População ausente ou confirmada há mais de 30 dias.');mapped.birds=Number(p.birds);}
++     const clean=validate(source.resource,mapped);let old=null;
++     if(source.resource==='production')old=await one(tx,'SELECT * FROM production WHERE tenant_id=? AND barn_id=? AND day=?',[source.tenant_id,clean.barn_id,clean.day]);
++     if(source.resource==='energy_readings')old=await one(tx,'SELECT * FROM energy_readings WHERE tenant_id=? AND meter_id=? AND day=?',[source.tenant_id,clean.meter_id,clean.day]);
++     if(old){const keys=source.resource==='production'?['eggs','birds']:['kwh','demand_kw','evidence'];if(keys.some(k=>String(old[k]??'')!==String(clean[k]??'')))fail(409,'Registro diário existente com valores diferentes. Corrija pelo cadastro autorizado.');duplicates++;}
++     else{const saved=await saveResource(tx,{id:actor?.id,role:'OWNER'},source.tenant_id,ent,source.resource,clean);if(source.resource==='costs')await update(tx,'costs',{source:ent.demo?'SIMULATED':'IMPORTED'},'id=?',[saved.id]);accepted++;}
++    }
++    await insert(tx,'imported_records',{id:uid(),tenant_id:source.tenant_id,source_id:source.id,fingerprint:recordHash,created_at:now()});
++   }catch(e:any){fail(e.status||400,`Linha ${i+2}: ${e.message}`);}
++  }
++  const result={id,accepted,duplicates,preview};if(preview)throw new Preview(result);
++  await update(tx,'import_runs',{status:'completed',accepted,duplicates,payload:null,finished_at:now()},'id=?',[id]);
++  await update(tx,'integration_sources',{last_status:'completed',last_run_at:now()},'id=?',[source.id]);
++  await audit(tx,actor,source.tenant_id,'import_completed','integration_sources',source.id,{accepted,duplicates});return result;
++ });return result;
++ }catch(e:any){if(e instanceof Preview)return e.result;
++  const message=e.status&&e.status<500?String(e.message).slice(0,1000):'Falha de processamento. Revise o arquivo e as referências.';
++  if(!preview){await update(db,'import_runs',{status:'failed',error:message,finished_at:now()},'id=?',[id]);await update(db,'integration_sources',{last_status:'failed',last_run_at:now()},'id=?',[source.id]);}
++  fail(e.status||400,message);
++ }
++ });
++}
+diff --git a/apps/api/src/automation-routes.ts b/apps/api/src/automation-routes.ts
+new file mode 100644
+index 0000000..0bbd7ee
+--- /dev/null
++++ b/apps/api/src/automation-routes.ts
+@@ -0,0 +1,106 @@
++import {z} from 'zod';
++import {one,insert,update} from '../../../packages/database/db.ts';
++import type {Database,Queryable,Row} from '../../../packages/database/db.ts';
++import type {Context,Route} from './app.ts';
++import {uid,now,fail,entitlement,saveResource,audit} from './domain.ts';
++import {resources} from '../../../packages/shared/resources.ts';
++import {token,hash,encryptSecret} from './security.ts';
++import {localClock,population,recordPopulation,runImport} from './automation-core.ts';
++import {allowedEndpoint} from './safe-source.ts';
++import {executiveReport} from './scheduled-reports.ts';
++
++type Register=(method:string,path:string,handler:Route['handler'],pub?:boolean)=>void;
++const manager=(c:Context)=>{if(!c.tenant)fail(400,'Selecione uma empresa.');if(!['EWS','OWNER','MANAGER'].includes(c.user!.role))fail(403,'Acesso restrito à gestão.');return c.tenant!;};
++async function scopedBarns(db:Queryable,c:Context){
++ if(!['EWS','OWNER','MANAGER','OPERATOR','TECH'].includes(c.user!.role))fail(403,'Perfil não autorizado ao modo funcionário.');
++ await entitlement(db,c.tenant!);
++ if(['OPERATOR','TECH'].includes(c.user!.role))return db.query('SELECT b.*,ub.preferred FROM barns b JOIN user_barns ub ON ub.barn_id=b.id AND ub.tenant_id=b.tenant_id WHERE b.tenant_id=? AND ub.user_id=? ORDER BY ub.preferred DESC,b.name',[c.tenant,c.user!.id]);
++ return db.query('SELECT * FROM barns WHERE tenant_id=? ORDER BY name',[c.tenant]);
++}
++async function requireBarn(db:Queryable,c:Context,id:string){const barn=(await scopedBarns(db,c)).find(b=>b.id===id);if(!barn)fail(403,'Galpão não atribuído ao seu usuário.');return barn;}
++export async function operationSummary(db:Queryable,tenant:string){
++ const ent=await entitlement(db,tenant),today=localClock(ent.timezone).day;
++ const barns=await db.query('SELECT b.id,b.name,p.id AS production_id,p.source,p.eggs FROM barns b LEFT JOIN production p ON p.barn_id=b.id AND p.tenant_id=b.tenant_id AND p.day=? WHERE b.tenant_id=? ORDER BY b.name',[today,tenant]);
++ const sources=await db.query('SELECT id,name,active,last_run_at,last_status,next_run_at FROM integration_sources WHERE tenant_id=? ORDER BY name',[tenant]);
++ const energy=ent.modules.includes('energy')?await one(db,'SELECT MAX(day) AS day,MAX(created_at) AS received_at FROM energy_readings WHERE tenant_id=?',[tenant]):null;
++ return {today,barns:ent.modules.includes('performance')?barns:[],sources,energy};
++}
++export function registerAutomationRoutes(db:Database,route:Register){
++ route('GET','/api/operations',async c=>{manager(c);return operationSummary(db,c.tenant!);});
++ route('GET','/api/staff',async c=>{
++  const barns=await scopedBarns(db,c),ent=await entitlement(db,c.tenant!),today=localClock(ent.timezone).day,ids=new Set(barns.map(b=>b.id));
++  const equipment=(await db.query('SELECT id,barn_id,name FROM equipment WHERE tenant_id=? ORDER BY name',[c.tenant])).filter(e=>ids.has(e.barn_id));
++  const scoped=Array.from(ids),placeholders=scoped.map(()=>'?').join(',');
++  const recent=ent.modules.includes('performance')&&scoped.length?await db.query(`SELECT * FROM production WHERE tenant_id=? AND barn_id IN (${placeholders}) ORDER BY day DESC,created_at DESC LIMIT 30`,[c.tenant,...scoped]):[];
++  const completed=ent.modules.includes('performance')&&scoped.length?await db.query(`SELECT barn_id FROM production WHERE tenant_id=? AND day=? AND barn_id IN (${placeholders})`,[c.tenant,today,...scoped]):[];
++  const tasks=ent.modules.includes('predict')?(await db.query("SELECT id,equipment_id,title,status,checklist,report,due_on,assignee,duration_minutes FROM work_orders WHERE tenant_id=? AND status<>'completed' AND (assignee=? OR assignee=?) ORDER BY due_on LIMIT 100",[c.tenant,c.user!.id,c.user!.email])).filter(o=>equipment.some(e=>e.id===o.equipment_id)):[];
++  return {today,modules:ent.modules,barns:await Promise.all(barns.map(async b=>({...b,population:await population(db,c.tenant!,b.id,today),done:completed.some(p=>p.barn_id===b.id)}))),equipment,recent,tasks};
++ });
++ route('POST','/api/staff/preference',async c=>{const {barn_id}=z.object({barn_id:z.string().uuid()}).parse(c.body);await requireBarn(db,c,barn_id);await db.transaction(async tx=>{await update(tx,'user_barns',{preferred:0},'tenant_id=? AND user_id=?',[c.tenant,c.user!.id]);await update(tx,'user_barns',{preferred:1},'tenant_id=? AND user_id=? AND barn_id=?',[c.tenant,c.user!.id,barn_id]);});return {ok:true};});
++ route('POST','/api/staff/production',async c=>{
++  const x=z.object({barn_id:z.string().uuid(),day:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),eggs:z.number().int().min(0).max(100000000),correct:z.boolean().default(false)}).strict().parse(c.body);
++  return db.transaction(async tx=>{
++   await requireBarn(tx,c,x.barn_id);const ent=await entitlement(tx,c.tenant!),today=localClock(ent.timezone).day;
++   if(x.day>today||(['OPERATOR','TECH'].includes(c.user!.role)&&x.day!==today))fail(403,'Seu perfil só pode registrar a data atual.');
++   const p=await population(tx,c.tenant!,x.barn_id,x.day);if(!p||Date.parse(x.day)-Date.parse(p.day)>30*86400000)fail(400,'Peça ao gestor para confirmar a população de aves deste galpão (validade: 30 dias).');
++   const old=await one(tx,'SELECT * FROM production WHERE tenant_id=? AND barn_id=? AND day=?',[c.tenant,x.barn_id,x.day]);
++   if(old&&Number(old.eggs)===x.eggs)return {id:old.id,duplicate:true};
++   if(old&&(!x.correct||!['EWS','OWNER','MANAGER'].includes(c.user!.role)))fail(409,'Produção já registrada. Uma correção exige gestor e confirmação.');
++   const result=await saveResource(tx,{...c.user,role:'MANAGER'},c.tenant!,ent,'production',{barn_id:x.barn_id,day:x.day,eggs:x.eggs,birds:Number(p.birds),source:'MANUAL'},old?.id);
++   await audit(tx,c.user,c.tenant,'staff_production','production',result.id);return result;
++  });
++ });
++ route('POST','/api/staff/incidents',async c=>{
++  const x=z.object({equipment_id:z.string().uuid(),category:z.enum(['Parou de funcionar','Ruído incomum','Aquecimento','Vazamento','Outro']),description:z.string().trim().min(3).max(180)}).strict().parse(c.body);
++  return db.transaction(async tx=>{const e=await one(tx,'SELECT barn_id FROM equipment WHERE tenant_id=? AND id=?',[c.tenant,x.equipment_id]);if(!e)fail(404,'Equipamento não encontrado.');await requireBarn(tx,c,e.barn_id);return saveResource(tx,{...c.user,role:'TECH'},c.tenant!,await entitlement(tx,c.tenant!),'incidents',{equipment_id:x.equipment_id,title:x.category+': '+x.description,severity:'warning',status:'open',assignee:'',action:''});});
++ });
++ route('POST','/api/staff/tasks/:id',async c=>{
++  if(!['TECH','OWNER','MANAGER','EWS'].includes(c.user!.role))fail(403,'Execução exige perfil técnico.');
++  const x=z.object({checklist:z.array(z.object({label:z.string().max(250),done:z.boolean()})).max(100),report:z.string().max(5000),duration_minutes:z.number().int().min(0),status:z.enum(['in_progress','completed'])}).strict().parse(c.body);
++  return db.transaction(async tx=>{const ent=await entitlement(tx,c.tenant!);if(!ent.modules.includes('predict'))fail(403,'Predict não incluído.');const o=await one(tx,'SELECT w.*,e.barn_id FROM work_orders w JOIN equipment e ON e.id=w.equipment_id WHERE w.tenant_id=? AND w.id=?',[c.tenant,c.params.id]);if(!o||![c.user!.id,c.user!.email].includes(o.assignee))fail(403,'Tarefa não atribuída a você.');await requireBarn(tx,c,o.barn_id);
++   if(!['assigned','in_progress'].includes(o.status)||x.status==='completed'&&o.status!=='in_progress')fail(409,'Inicie a tarefa antes de concluir.');
++   const original=JSON.parse(o.checklist);if(original.length!==x.checklist.length||original.some((v:Row,i:number)=>v.label!==x.checklist[i].label))fail(400,'Checklist difere da ordem original.');
++   if(x.status==='completed'&&(!x.report.trim()||x.checklist.some(i=>!i.done)))fail(400,'Conclua o checklist e informe o relatório.');
++   await update(tx,'work_orders',{...x,checklist:JSON.stringify(x.checklist),completed_at:x.status==='completed'?now():null},'id=? AND tenant_id=?',[o.id,c.tenant]);await audit(tx,c.user,c.tenant,'staff_task','work_orders',o.id);return {ok:true};
++  });
++ });
++ route('GET','/api/staff/assignments/:id',async c=>{manager(c);return {items:await db.query('SELECT barn_id,preferred FROM user_barns WHERE tenant_id=? AND user_id=?',[c.tenant,c.params.id])};});
++ route('PUT','/api/staff/assignments/:id',async c=>{
++  manager(c);const x=z.object({barn_ids:z.array(z.string().uuid()).max(200),preferred:z.string().uuid().nullable()}).strict().parse(c.body);
++  return db.transaction(async tx=>{if(!await one(tx,'SELECT id FROM users WHERE id=? AND tenant_id=?',[c.params.id,c.tenant]))fail(404,'Usuário não encontrado.');if(x.preferred&&!x.barn_ids.includes(x.preferred))fail(400,'Galpão habitual precisa estar atribuído.');for(const id of x.barn_ids)if(!await one(tx,'SELECT id FROM barns WHERE id=? AND tenant_id=?',[id,c.tenant]))fail(400,'Galpão inválido.');await tx.query('DELETE FROM user_barns WHERE tenant_id=? AND user_id=?',[c.tenant,c.params.id]);for(const id of new Set(x.barn_ids))await insert(tx,'user_barns',{tenant_id:c.tenant,user_id:c.params.id,barn_id:id,preferred:id===x.preferred?1:0});await audit(tx,c.user,c.tenant,'barn_assignments','users',c.params.id);return {ok:true};});
++ });
++ route('POST','/api/population',async c=>{manager(c);const x=z.object({barn_id:z.string().uuid(),day:z.string(),birds:z.number().int()}).strict().parse(c.body);return db.transaction(async tx=>{const ent=await entitlement(tx,c.tenant!);if(!ent.modules.includes('performance'))fail(403,'Performance não incluído.');const created=await recordPopulation(tx,c.tenant!,x,ent.demo?'SIMULATED':'MANUAL');await audit(tx,c.user,c.tenant,'population_confirmed','barns',x.barn_id);return {created};});});
++ const sourceSchema=z.object({name:z.string().trim().min(2).max(100),resource:z.enum(['production','birds','energy_readings','costs']),kind:z.enum(['manual','api','https']),format:z.enum(['csv','xlsx']),mapping:z.record(z.string().min(1).max(100)).refine(m=>Object.keys(m).length>0&&Object.keys(m).length<=20),endpoint:z.string().max(1000).default(''),secret:z.string().max(4000).optional(),interval_minutes:z.number().int().min(15).max(10080),active:z.number().int().min(0).max(1)}).strict();
++ const sourceFor=async(c:Context)=>{manager(c);await entitlement(db,c.tenant!);const s=await one(db,'SELECT * FROM integration_sources WHERE id=? AND tenant_id=?',[c.params.id,c.tenant]);if(!s)fail(404,'Integração não encontrada.');return s;};
++ route('GET','/api/integrations',async c=>{manager(c);await entitlement(db,c.tenant!);return {items:(await db.query('SELECT * FROM integration_sources WHERE tenant_id=? ORDER BY created_at DESC',[c.tenant])).map(({secret,token_hash,...s})=>({...s,mapping:JSON.parse(s.mapping),credential_configured:!!secret}))};});
++ for(const method of ['POST','PUT'])route(method,method==='POST'?'/api/integrations':'/api/integrations/:id',async c=>{
++  manager(c);const ent=await entitlement(db,c.tenant!),x=sourceSchema.parse(c.body);if(!ent.modules.includes(x.resource==='energy_readings'?'energy':'performance'))fail(403,'Módulo não incluído.');
++  const allowed=x.resource==='birds'?['barn_id','birds','day']:Object.keys(resources[x.resource].fields).filter(k=>k!=='source');if(Object.keys(x.mapping).some(k=>!allowed.includes(k)))fail(400,'Campo de destino não permitido.');
++  if(x.kind==='https')allowedEndpoint(x.endpoint);
++  const id=c.params.id||uid(),old=method==='PUT'?await sourceFor(c):null,raw=x.kind==='api'&&!old?token():null;
++  const {secret,...values}=x;const data={...values,mapping:JSON.stringify(x.mapping),secret:secret?encryptSecret(secret):old?.secret||null,token_hash:old?.token_hash||(raw?hash(raw):null),next_run_at:now()};
++  if(old&&old.resource!==x.resource)fail(409,'Crie outra integração para mudar o recurso.');
++  if(old)await update(db,'integration_sources',data,'id=? AND tenant_id=?',[id,c.tenant]);else await insert(db,'integration_sources',{id,tenant_id:c.tenant,...data,created_at:now()});await audit(db,c.user,c.tenant,'integration_saved','integration_sources',id);return {id,...(raw?{token:raw}:{})};
++ });
++ route('POST','/api/integrations/:id/token',async c=>{const s=await sourceFor(c);if(s.kind!=='api')fail(400,'Fonte não é API.');const raw=token();await update(db,'integration_sources',{token_hash:hash(raw)},'id=?',[s.id]);await audit(db,c.user,c.tenant,'integration_token_rotated','integration_sources',s.id);return {token:raw};});
++ const payload=z.object({content:z.string().max(2000000).optional(),rows:z.array(z.record(z.any())).max(1000).optional()}).strict().refine(x=>!!x.content!==!!x.rows,'Envie arquivo OU registros.');
++ for(const action of ['preview','import'])route('POST','/api/integrations/:id/'+action,async c=>{const s=await sourceFor(c);return runImport(db,s,payload.parse(c.body),action==='preview',c.user);});
++ route('POST','/api/integrations/:id/sync',async c=>{const s=await sourceFor(c);if(s.kind!=='https')fail(400,'Sincronização somente para HTTPS.');await update(db,'integration_sources',{next_run_at:now()},'id=?',[s.id]);return {message:'Sincronização solicitada ao worker.'};});
++ route('GET','/api/integrations/:id/runs',async c=>{const s=await sourceFor(c);return {items:await db.query('SELECT id,status,accepted,duplicates,error,started_at,finished_at FROM import_runs WHERE tenant_id=? AND source_id=? ORDER BY started_at DESC LIMIT 50',[c.tenant,s.id])};});
++ route('POST','/api/integrations/:id/retry/:run',async c=>{const s=await sourceFor(c),r=await one(db,"SELECT payload FROM import_runs WHERE id=? AND tenant_id=? AND source_id=? AND status='failed'",[c.params.run,c.tenant,s.id]);if(!r?.payload)fail(409,'Arquivo não retido. Envie novamente ou solicite sincronização.');return runImport(db,s,JSON.parse(r.payload),false,c.user);});
++ route('POST','/api/import-feed',async c=>{const auth=c.request.headers.authorization||'';if(!auth.startsWith('Bearer '))fail(401,'Token inválido.');const s=await one(db,"SELECT * FROM integration_sources WHERE token_hash=? AND kind='api' AND active=1",[hash(auth.slice(7))]);if(!s)fail(401,'Token inválido.');return runImport(db,s,payload.parse(c.body));},true);
++ const reportSchema=z.object({name:z.string().min(2).max(100),frequency:z.enum(['daily','weekly']),weekday:z.number().int().min(0).max(6),send_time:z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),timezone:z.string().refine(v=>{try{new Intl.DateTimeFormat('en',{timeZone:v});return true;}catch{return false;}}),barn_ids:z.array(z.string().uuid()).max(100),indicators:z.array(z.enum(['production','energy','maintenance','attention'])).min(1).max(4),recipient_ids:z.array(z.string().uuid()).min(1).max(20),active:z.number().int().min(0).max(1)}).strict();
++ const reportFor=async(c:Context)=>{manager(c);await entitlement(db,c.tenant!);const s=await one(db,'SELECT * FROM report_schedules WHERE tenant_id=? AND id=?',[c.tenant,c.params.id]);if(!s)fail(404,'Agendamento não encontrado.');return s;};
++ route('GET','/api/report-schedules',async c=>{manager(c);await entitlement(db,c.tenant!);const items=await db.query('SELECT * FROM report_schedules WHERE tenant_id=? ORDER BY created_at DESC',[c.tenant]);return {smtp_configured:!!process.env.SMTP_HOST,items:await Promise.all(items.map(async s=>({...s,barn_ids:JSON.parse(s.barn_ids),indicators:JSON.parse(s.indicators),recipient_ids:(await db.query('SELECT user_id FROM report_recipients WHERE tenant_id=? AND schedule_id=?',[c.tenant,s.id])).map(u=>u.user_id)}))),recipients:await db.query("SELECT id,name,email FROM users WHERE tenant_id=? AND active=1 AND role IN ('OWNER','MANAGER') AND access_profile=''",[c.tenant])};});
++ for(const method of ['POST','PUT'])route(method,method==='POST'?'/api/report-schedules':'/api/report-schedules/:id',async c=>{
++  manager(c);await entitlement(db,c.tenant!);const x=reportSchema.parse(c.body),id=c.params.id||uid();if(method==='PUT')await reportFor(c);
++  return db.transaction(async tx=>{for(const barn of x.barn_ids)if(!await one(tx,'SELECT id FROM barns WHERE id=? AND tenant_id=?',[barn,c.tenant]))fail(400,'Galpão inválido.');for(const user of x.recipient_ids)if(!await one(tx,"SELECT id FROM users WHERE id=? AND tenant_id=? AND active=1 AND role IN ('OWNER','MANAGER') AND access_profile=''",[user,c.tenant]))fail(400,'Destinatário não autorizado.');
++   const {recipient_ids,...v}=x;const data={...v,barn_ids:JSON.stringify([...new Set(x.barn_ids)]),indicators:JSON.stringify(x.indicators)};
++   if(method==='PUT')await update(tx,'report_schedules',data,'id=? AND tenant_id=?',[id,c.tenant]);else await insert(tx,'report_schedules',{id,tenant_id:c.tenant,...data,created_at:now()});
++   await tx.query('DELETE FROM report_recipients WHERE schedule_id=? AND tenant_id=?',[id,c.tenant]);for(const user of new Set(recipient_ids))await insert(tx,'report_recipients',{tenant_id:c.tenant,schedule_id:id,user_id:user});await audit(tx,c.user,c.tenant,'report_schedule_saved','report_schedules',id);return {id};
++  });
++ });
++ route('GET','/api/report-schedules/:id/preview',async c=>{const s=await reportFor(c),r=await executiveReport(db,s);c.headers['content-type']='text/html; charset=utf-8';c.headers['content-security-policy']="default-src 'none'; style-src 'unsafe-inline'; sandbox";return r.html;});
++ route('GET','/api/report-schedules/:id/deliveries',async c=>{const s=await reportFor(c);return {items:await db.query('SELECT id,user_id,slot,status,attempts,error,created_at,sent_at FROM report_deliveries WHERE tenant_id=? AND schedule_id=? ORDER BY created_at DESC LIMIT 100',[c.tenant,s.id])};});
++ route('POST','/api/report-schedules/:id/retry/:run',async c=>{const s=await reportFor(c);const delivery=await one(db,"SELECT id FROM report_deliveries WHERE id=? AND tenant_id=? AND schedule_id=? AND status='failed'",[c.params.run,c.tenant,s.id]);if(!delivery)fail(409,'Envio não está em falha.');await update(db,'report_deliveries',{status:'pending',attempts:0,next_attempt_at:now(),error:null},'id=?',[delivery.id]);await audit(db,c.user,c.tenant,'report_retry','report_deliveries',delivery.id);return {ok:true};});
++}
+diff --git a/apps/api/src/fastify-transport.ts b/apps/api/src/fastify-transport.ts
+new file mode 100644
+index 0000000..bee5f63
+--- /dev/null
++++ b/apps/api/src/fastify-transport.ts
+@@ -0,0 +1,7 @@
++import type {Database} from '../../../packages/database/db.ts';
++import {createApp} from './app.ts';
++export async function fastifyTransport(db:Database,logger=false){
++ const name='fastify';const factory=(await import(name)).default;
++ const app=createApp(db),server=factory({logger:logger?{redact:['req.headers.authorization','req.headers.cookie','req.body']}:false,bodyLimit:2200000,trustProxy:process.env.TRUST_PROXY==='1'?1:false});
++ server.all('/api/*',async(req:any,reply:any)=>{const result=await app.dispatch({method:req.method,url:req.url,headers:req.headers,body:req.body,ip:req.ip});for(const [k,v]of Object.entries(result.headers))reply.header(k,v);return reply.code(result.status).send(result.body);});return server;
++}
+diff --git a/apps/api/src/safe-source.ts b/apps/api/src/safe-source.ts
+new file mode 100644
+index 0000000..e6a78f9
+--- /dev/null
++++ b/apps/api/src/safe-source.ts
+@@ -0,0 +1,25 @@
++import {lookup} from 'node:dns/promises';
++import {request} from 'node:https';
++import {isIP} from 'node:net';
++import {fail} from './domain.ts';
++export function allowedEndpoint(value:string){
++ let url:URL;try{url=new URL(value);}catch{fail(400,'URL HTTPS inválida.');}
++ const allowed=(process.env.IMPORT_ALLOWED_HOSTS||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
++ if(url!.protocol!=='https:'||url!.username||url!.password||url!.hash||url!.search||url!.port&&url!.port!=='443'||isIP(url!.hostname)||!allowed.includes(url!.hostname.toLowerCase()))fail(400,'Use HTTPS, sem credenciais/query na URL, em um host liberado pelo administrador da infraestrutura.');
++ return url!;
++}
++export function publicIPv4(ip:string){
++ if(isIP(ip)!==4)return false;const [a,b,c]=ip.split('.').map(Number);
++ return !(a===0||a===10||a===127||a>=224||a===169&&b===254||a===172&&b>=16&&b<=31||a===192&&b===168||a===100&&b>=64&&b<=127||a===198&&(b===18||b===19)||a===192&&b===0||a===192&&b===88&&c===99||a===198&&b===51&&c===100||a===203&&b===0&&c===113);
++}
++export async function fetchSource(endpoint:string,bearer:string){
++ const url=allowedEndpoint(endpoint);const addresses=await lookup(url.hostname,{all:true});
++ if(!addresses.length||addresses.some(a=>!publicIPv4(a.address)))fail(400,'DNS precisa resolver exclusivamente endereços IPv4 públicos.');
++ // Pin the validated address while preserving hostname verification and TLS SNI.
++ return new Promise<Buffer>((resolve,reject)=>{
++ const req=request(url,{method:'GET',headers:{Accept:'text/csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',...(bearer?{Authorization:'Bearer '+bearer}:{})},lookup:(_host,_options,cb:any)=>cb(null,addresses[0].address,4)},res=>{
++  if(res.statusCode!==200){res.resume();reject(new Error('Endpoint não retornou HTTP 200. Redirecionamentos não são aceitos.'));return;}
++  let size=0;const parts:Buffer[]=[];res.on('data',chunk=>{size+=chunk.length;if(size>1500000){req.destroy(new Error('Arquivo excede 1,5 MB.'));return;}parts.push(chunk);});res.on('end',()=>resolve(Buffer.concat(parts)));res.on('error',reject);
++ });const timer=setTimeout(()=>req.destroy(new Error('Tempo de download excedido.')),15000);req.on('close',()=>clearTimeout(timer));req.on('error',reject);req.end();
++ });
++}
+diff --git a/apps/api/src/scheduled-reports.ts b/apps/api/src/scheduled-reports.ts
+new file mode 100644
+index 0000000..251f684
+--- /dev/null
++++ b/apps/api/src/scheduled-reports.ts
+@@ -0,0 +1,70 @@
++import {one,insert,update} from '../../../packages/database/db.ts';
++import type {Database,Queryable,Row} from '../../../packages/database/db.ts';
++import {dashboard,entitlement,uid,now,fail} from './domain.ts';
++import {localClock,lease} from './automation-core.ts';
++export const escapeHtml=(s:any)=>String(s??'Sem dados').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
++const shift=(day:string,n:number)=>new Date(Date.parse(day+'T12:00:00Z')+n*86400000).toISOString().slice(0,10);
++const num=(value:any,unit='')=>value==null?'Sem dados':Number(value).toLocaleString('pt-BR',{maximumFractionDigits:2})+unit;
++export async function executiveReport(db:Queryable,s:Row,at=new Date()){
++ const ent=await entitlement(db,s.tenant_id);const end=shift(localClock(s.timezone,at).day,-1),length=s.frequency==='weekly'?7:1,start=shift(end,1-length);
++ const barns:string[]=JSON.parse(s.barn_ids),indicators:string[]=JSON.parse(s.indicators),scopes=barns.length?barns:[''];
++ const sections:string[]=[];const metrics:Row[]=[];const totals:Row[]=[];
++ for(const barn of scopes){
++  const d:Row=await dashboard(db,s.tenant_id,{from:start,to:end,barn}),previous=await dashboard(db,s.tenant_id,{from:shift(start,-length),to:shift(start,-1),barn});
++  const filters=barn?' AND barn_id=?':'',args=barn?[s.tenant_id,start,end,barn]:[s.tenant_id,start,end];
++  const production=await db.query('SELECT barn_id,SUM(eggs) AS eggs,SUM(birds) AS birds,COUNT(*) AS days FROM production WHERE tenant_id=? AND day>=? AND day<=?'+filters+' GROUP BY barn_id',args);
++  const previousCount=await one(db,'SELECT COUNT(*) AS n FROM production WHERE tenant_id=? AND day>=? AND day<=?'+filters,barn?[s.tenant_id,shift(start,-length),shift(start,-1),barn]:[s.tenant_id,shift(start,-length),shift(start,-1)]);
++  const count=production.reduce((n,x)=>n+Number(x.days),0),expected=d.barns.length*length;
++  const comparable=expected>0&&count===expected&&Number(previousCount.n)===expected;
++  const delta=(a:any,b:any,valid:boolean)=>valid&&a!=null&&b>0?num((a-b)/b*100,'%'):'Comparação indisponível: cobertura/base insuficiente';
++  totals.push({eggs:d.performance.eggs,kwh:d.energy.kwh});
++  const title=barn?d.barns[0]?.name:'Toda a granja';const rows:any[]=[];
++  if(indicators.includes('production')&&ent.modules.includes('performance')){
++   rows.push(['Ovos registrados',num(d.performance.eggs)],['Ovos por ave-dia',num(d.performance.per_bird)],['Variação da produção',delta(d.performance.eggs,previous.performance.eggs,comparable)],['Cobertura da produção',`${count}/${expected} registros galpão-dia`]);
++   for(const b of d.barns){const p=production.find(x=>x.barn_id===b.id);rows.push([b.name,p?num(p.eggs,' ovos'):'Sem dados']);}
++  }
++  if(indicators.includes('energy')&&ent.modules.includes('energy')){
++   const energies=await db.query('SELECT e.meter_id,e.day FROM energy_readings e JOIN meters m ON m.id=e.meter_id WHERE e.tenant_id=? AND e.day>=? AND e.day<=?'+(barn?' AND m.barn_id=?':''),barn?[s.tenant_id,shift(start,-length),end,barn]:[s.tenant_id,shift(start,-length),end]);
++   const meterIds=[...new Set(energies.map(x=>x.meter_id))];const complete=meterIds.length>0&&energies.length===meterIds.length*length*2;
++   rows.push(['Consumo registrado',num(d.energy.kwh,' kWh')],['Custo estimado com tarifa',d.energy.cost_cents==null?'Sem dados / tarifa ausente':num(d.energy.cost_cents/100,' R$')],['Variação de energia',delta(d.energy.kwh,previous.energy.kwh,complete)]);
++   if(complete&&previous.energy.kwh>0&&d.energy.kwh>previous.energy.kwh*1.2)rows.push(['Atenção','Consumo aumentou mais de 20%. Investigue a causa; não é diagnóstico.']);
++   if(barn&&d.energy.kwh==null)rows.push(['Escopo energético','Medição geral não é distribuída entre galpões.']);
++  }
++  if(indicators.includes('maintenance')){
++   const orders=await db.query('SELECT w.status,w.completed_at FROM work_orders w JOIN equipment e ON e.id=w.equipment_id WHERE w.tenant_id=?'+(barn?' AND e.barn_id=?':''),barn?[s.tenant_id,barn]:[s.tenant_id]);
++   const faults=await one(db,"SELECT COUNT(DISTINCT i.equipment_id) AS n FROM incidents i JOIN equipment e ON e.id=i.equipment_id WHERE i.tenant_id=? AND i.status<>'closed'"+(barn?' AND e.barn_id=?':''),barn?[s.tenant_id,barn]:[s.tenant_id]);
++   rows.push(['Ocorrências abertas agora',d.monitor.active_alerts],['Equipamentos com ocorrências abertas',faults.n]);
++   if(ent.modules.includes('predict'))rows.push(['Ordens pendentes agora',orders.filter(o=>o.status!=='completed').length],['Manutenções concluídas no período',orders.filter(o=>o.completed_at&&localClock(s.timezone,new Date(o.completed_at)).day>=start&&localClock(s.timezone,new Date(o.completed_at)).day<=end).length]);
++  }
++  if(indicators.includes('attention')){rows.push(['Equipamentos sem comunicação agora',d.monitor.offline],['Produção pendente no período',Math.max(0,expected-count)]);const sources=await db.query('SELECT DISTINCT source FROM production WHERE tenant_id=? AND day>=? AND day<=?'+filters,args);rows.push(['Origem da produção',sources.map(x=>x.source).join(', ')||'Sem dados']);const eSources=await db.query('SELECT DISTINCT e.source FROM energy_readings e JOIN meters m ON m.id=e.meter_id WHERE e.tenant_id=? AND e.day>=? AND e.day<=?'+(barn?' AND m.barn_id=?':''),args);rows.push(['Origem da energia',eSources.map(x=>x.source).join(', ')||'Sem dados']);}
++  sections.push(`<h2>${escapeHtml(title)}</h2><table role="presentation" style="width:100%;border-collapse:collapse">${rows.map(([k,v])=>`<tr><td style="padding:12px 0;border-bottom:1px solid #dde4ee">${escapeHtml(k)}</td><td style="padding:12px;text-align:right;border-bottom:1px solid #dde4ee">${escapeHtml(v)}</td></tr>`).join('')}</table>`);metrics.push({barn,rows});
++ }
++ if(scopes.length>1){const sum=(key:string)=>totals.some(t=>t[key]==null)?'Sem dados completos':num(totals.reduce((n,t)=>n+Number(t[key]),0));sections.unshift(`<h2>Total dos galpões selecionados</h2>${indicators.includes('production')?`<p>Produção: ${sum('eggs')} ovos</p>`:''}${indicators.includes('energy')?`<p>Energia: ${sum('kwh')} kWh</p>`:''}`);}
++ const subject=`${ent.demo?'[DEMONSTRAÇÃO] ':''}EWS AgroIntelligence · ${start} a ${end}`;
++ const html=`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;background:#f3f6fb;font:16px Arial;color:#15233b"><main style="max-width:680px;margin:auto;padding:24px;background:#fff"><p style="color:#2563eb;font-weight:bold">EWS TECH / AGROINTELLIGENCE</p><h1 style="font-size:28px">Sua granja em perspectiva</h1><p>${escapeHtml(ent.tenant_name)} · ${start} a ${end}</p>${ent.demo?'<p style="background:#fff2cc;padding:16px">DEMONSTRAÇÃO — TODOS OS DADOS SÃO FICTÍCIOS.</p>':''}${sections.join('')}<p style="font-size:13px;color:#55657b">Período em ${escapeHtml(s.timezone)}. Estados de equipamentos e pendências são atuais. Ausência de dado não significa zero. Variações exigem cobertura comparável. Custos são estimativas; oportunidades exigem investigação. Consulte o sistema para relatório PDF e detalhes.</p></main></body></html>`;
++ return {subject,html,start,end,metrics};
++}
++export async function scheduleReports(db:Database,at=new Date()){
++ const schedules=await db.query('SELECT * FROM report_schedules WHERE active=1');
++ for(const s of schedules)await lease(db,'schedule:'+s.id,async()=>{
++  const clock=localClock(s.timezone,at),weekday=new Date(clock.day+'T12:00:00Z').getUTCDay();
++  if(clock.time<s.send_time||s.frequency==='weekly'&&weekday!==s.weekday)return;
++  try{await db.transaction(async tx=>{
++   const current=await one(tx,'SELECT * FROM report_schedules WHERE id=?',[s.id]);if(!current.active||current.last_slot===clock.day)return;
++   const report=await executiveReport(tx,current,at);
++   const users=await tx.query("SELECT u.id FROM report_recipients r JOIN users u ON u.id=r.user_id AND u.tenant_id=r.tenant_id WHERE r.schedule_id=? AND r.tenant_id=? AND u.active=1 AND u.role IN ('OWNER','MANAGER') AND u.access_profile=''",[s.id,s.tenant_id]);
++   for(const u of users)await tx.query('INSERT INTO report_deliveries(id,tenant_id,schedule_id,user_id,slot,status,subject,html,next_attempt_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(schedule_id,user_id,slot) DO NOTHING',[uid(),s.tenant_id,s.id,u.id,clock.day,'pending',report.subject,report.html,now(),now()]);
++   await update(tx,'report_schedules',{last_slot:clock.day},'id=?',[s.id]);
++  });}catch{console.error(JSON.stringify({event:'report_schedule_failed',schedule_id:s.id}));}
++ });
++}
++export async function deliverReports(db:Database,sendMail:(message:Row)=>Promise<any>,at=new Date()){
++ const queue=await db.query("SELECT id FROM report_deliveries WHERE status='pending' AND next_attempt_at<=? AND attempts<5 ORDER BY created_at LIMIT 20",[at.toISOString()]);
++ for(const item of queue)await lease(db,'delivery:'+item.id,async()=>{
++  const m=await one(db,'SELECT * FROM report_deliveries WHERE id=?',[item.id]);if(m.status!=='pending')return;
++  const u=await one(db,"SELECT u.email FROM users u JOIN report_recipients r ON r.user_id=u.id AND r.tenant_id=u.tenant_id JOIN report_schedules s ON s.id=r.schedule_id AND s.tenant_id=r.tenant_id WHERE u.id=? AND u.tenant_id=? AND r.schedule_id=? AND u.active=1 AND s.active=1 AND u.role IN ('OWNER','MANAGER') AND u.access_profile=''",[m.user_id,m.tenant_id,m.schedule_id]);
++  if(!u){await update(db,'report_deliveries',{status:'cancelled',error:'Destinatário ou agendamento não autorizado.'},'id=?',[m.id]);return;}
++  try{await entitlement(db,m.tenant_id);await sendMail({to:u.email,subject:m.subject,html:m.html,messageId:`<${m.id}@ews-agro.local>`});await update(db,'report_deliveries',{status:'sent',sent_at:now(),error:null},'id=?',[m.id]);}
++  catch{const attempts=Number(m.attempts)+1;await update(db,'report_deliveries',{attempts,status:attempts>=5?'failed':'pending',error:'Falha no envio. Verifique SMTP e assinatura.',next_attempt_at:new Date(at.getTime()+2**attempts*60000).toISOString()},'id=?',[m.id]);}
++ });
++}
+diff --git a/apps/api/src/server.ts b/apps/api/src/server.ts
+index 68de533..2d2ff2a 100644
+--- a/apps/api/src/server.ts
++++ b/apps/api/src/server.ts
+@@ -1,3 +1,4 @@
++import {fastifyTransport} from './fastify-transport.ts';
+ import { createServer } from 'node:http';
+ import { connect } from '../../../packages/database/db.ts';
+ import { migrate } from '../../../packages/database/migrate.ts';
+@@ -10,8 +11,7 @@ let close:()=>Promise<any>;
+ let fastifyFactory:any;
+ try{const moduleName='fastify';fastifyFactory=(await import(moduleName)).default;}catch{if(prod)throw new Error('Instale Fastify com pnpm install.');}
+ if(fastifyFactory){
+- const server=fastifyFactory({logger:{redact:['req.headers.authorization','req.headers.cookie','req.body']},bodyLimit:2200000,trustProxy:process.env.TRUST_PROXY==='1'?1:false});
+- server.all('/api/*',async(req:any,reply:any)=>{const result=await app.dispatch({method:req.method,url:req.url,headers:req.headers,body:req.body,ip:req.ip});for(const [k,v]of Object.entries(result.headers))reply.header(k,v);return reply.code(result.status).send(result.body);});
++ const server=await fastifyTransport(db,true);
+  await server.listen({port,host});close=()=>server.close();
+ }else{
+  console.warn('Desenvolvimento: transporte HTTP nativo. Produção requer Fastify.');
+diff --git a/apps/worker/automation.ts b/apps/worker/automation.ts
+new file mode 100644
+index 0000000..7c9eaee
+--- /dev/null
++++ b/apps/worker/automation.ts
+@@ -0,0 +1,22 @@
++import {one,insert,update} from '../../packages/database/db.ts';
++import type {Database,Row} from '../../packages/database/db.ts';
++import {uid,now} from '../api/src/domain.ts';
++import {lease,runImport} from '../api/src/automation-core.ts';
++import {fetchSource} from '../api/src/safe-source.ts';
++import {decryptSecret} from '../api/src/security.ts';
++import {scheduleReports,deliverReports} from '../api/src/scheduled-reports.ts';
++export async function automationTick(db:Database,options:{at?:Date;fetch?:(url:string,secret:string)=>Promise<Buffer>;sendMail?:(message:Row)=>Promise<any>}={}){
++ const at=options.at||new Date();
++ const sources=await db.query("SELECT id FROM integration_sources WHERE active=1 AND kind='https' AND next_run_at<=? ORDER BY next_run_at LIMIT 10",[at.toISOString()]);
++ for(const {id}of sources)await lease(db,'fetch:'+id,async()=>{
++  const s=await one(db,'SELECT * FROM integration_sources WHERE id=?',[id]);if(!s?.active||s.kind!=='https'||s.next_run_at>at.toISOString())return;
++  try{const bytes=await (options.fetch||fetchSource)(s.endpoint,s.secret?decryptSecret(s.secret):'');await runImport(db,s,{content:s.format==='xlsx'?bytes.toString('base64'):bytes.toString('utf8')});}
++  catch{await update(db,'integration_sources',{last_run_at:now(),last_status:'failed'},'id=?',[s.id]);await insert(db,'import_runs',{id:uid(),tenant_id:s.tenant_id,source_id:s.id,fingerprint:'fetch',status:'failed',error:'Sincronização falhou. Verifique host autorizado, credencial, conectividade e arquivo.',started_at:now(),finished_at:now()});}
++  finally{await update(db,'integration_sources',{next_run_at:new Date(at.getTime()+s.interval_minutes*60000).toISOString()},'id=?',[s.id]);}
++ });
++ await scheduleReports(db,at);
++ if(options.sendMail)await deliverReports(db,options.sendMail,at);
++ await db.query("UPDATE import_runs SET payload=NULL WHERE started_at<? AND payload IS NOT NULL",[new Date(at.getTime()-7*86400000).toISOString()]);
++ await db.query("UPDATE import_runs SET status='failed',error='Execução interrompida. Reprocesse o arquivo.',finished_at=? WHERE status='running' AND started_at<?",[now(),new Date(at.getTime()-15*60000).toISOString()]);
++ await db.query("UPDATE report_deliveries SET html='' WHERE status IN ('sent','cancelled') AND created_at<?",[new Date(at.getTime()-30*86400000).toISOString()]);
++}
+diff --git a/apps/worker/index.ts b/apps/worker/index.ts
+index 03f0654..696bcbb 100644
+--- a/apps/worker/index.ts
++++ b/apps/worker/index.ts
+@@ -1,3 +1,5 @@
++import {automationTick} from './automation.ts';
++import {lease} from '../api/src/automation-core.ts';
+ import { connect,one,update,insert } from '../../packages/database/db.ts';
+ import { randomUUID } from 'node:crypto';
+ import { ingest } from '../api/src/domain.ts';
+@@ -9,9 +11,10 @@ async function tick(){
+  const gateways=await db.query('SELECT g.* FROM gateways g JOIN tenants t ON t.id=g.tenant_id WHERE t.demo=1 AND g.active=1');
+  for(const g of gateways){const tags=await db.query('SELECT t.*,l.value FROM tags t LEFT JOIN tag_latest l ON l.tag_id=t.id WHERE t.gateway_id=?',[g.id]);const old=await one(db,'SELECT MAX(sequence) AS n FROM measurements WHERE gateway_id=?',[g.id]);let sequence=Number(old.n||0);const rows=tags.map(t=>({tag_id:t.id,sequence:++sequence,value:t.kind==='temperature'?+(27+Math.sin(Date.now()/600000)*2).toFixed(2):t.kind==='hours'?Number(t.value||0)+10/3600:Number(t.value||0),unit:t.unit,quality:'GOOD',source:'SIMULATED',observed_at:now}));if(rows.length)await db.transaction(tx=>ingest(tx,g,rows));}
+  }
+- if(process.env.SMTP_HOST){const moduleName='nodemailer';const mailer=await import(moduleName);const transport=mailer.default.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_SECURE==='true',requireTLS:process.env.SMTP_SECURE!=='true',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined});
++ await automationTick(db);
++ if(process.env.SMTP_HOST){const moduleName='nodemailer';const mailer=await import(moduleName);const transport=mailer.default.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_SECURE==='true',connectionTimeout:15000,greetingTimeout:15000,socketTimeout:60000,requireTLS:process.env.SMTP_SECURE!=='true',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined});
+   const mails=await db.query("SELECT * FROM outbox WHERE status='pending' AND next_attempt_at<=? AND attempts<5 ORDER BY created_at LIMIT 20",[now]);
+-  for(const m of mails){try{await transport.sendMail({from:process.env.SMTP_FROM,to:m.recipient,subject:m.subject,text:m.body,messageId:`<${m.id}@ews-agro.local>`});await update(db,'outbox',{status:'sent',body:'[conteúdo removido após envio]'},'id=?',[m.id]);}catch{await update(db,'outbox',{attempts:m.attempts+1,next_attempt_at:new Date(Date.now()+2**m.attempts*60000).toISOString(),status:m.attempts>=4?'failed':'pending'},'id=?',[m.id]);}}transport.close();
++  for(const m of mails){try{await transport.sendMail({from:process.env.SMTP_FROM,to:m.recipient,subject:m.subject,text:m.body,messageId:`<${m.id}@ews-agro.local>`});await update(db,'outbox',{status:'sent',body:'[conteúdo removido após envio]'},'id=?',[m.id]);}catch{await update(db,'outbox',{attempts:m.attempts+1,next_attempt_at:new Date(Date.now()+2**m.attempts*60000).toISOString(),status:m.attempts>=4?'failed':'pending'},'id=?',[m.id]);}}await automationTick(db,{sendMail:(message)=>transport.sendMail({from:process.env.SMTP_FROM,...message})});transport.close();
+  }
+  // Preventive suggestions are generated once per equipment and threshold.
+  const plans=await db.query("SELECT p.*,l.value FROM maintenance_plans p JOIN tags t ON t.equipment_id=p.equipment_id AND t.kind='hours' JOIN tag_latest l ON l.tag_id=t.id WHERE l.quality='GOOD' AND l.value>=p.next_hours AND l.observed_at>=?",[new Date(Date.now()-120000).toISOString()]);
+@@ -24,5 +27,5 @@ async function tick(){
+   await db.query('DELETE FROM audit_logs WHERE created_at<?',[new Date(Date.now()-Number(process.env.AUDIT_RETENTION_DAYS||365)*86400000).toISOString()]);lastRetention=Date.now();
+  }
+ }
+-while(running){try{await tick();console.log(JSON.stringify({event:'worker_tick',at:new Date().toISOString()}));}catch(e:any){console.error(JSON.stringify({event:'worker_error',type:e.name}));}await new Promise(r=>setTimeout(r,10000));}
++while(running){try{await lease(db,'worker:tick',tick);console.log(JSON.stringify({event:'worker_tick',at:new Date().toISOString()}));}catch(e:any){console.error(JSON.stringify({event:'worker_error',type:e.name}));}await new Promise(r=>setTimeout(r,10000));}
+ await db.close();
+diff --git a/packages/database/migrate.ts b/packages/database/migrate.ts
+index be3956f..cd5834d 100644
+--- a/packages/database/migrate.ts
++++ b/packages/database/migrate.ts
+@@ -5,5 +5,10 @@ import { pathToFileURL } from 'node:url';
+ export async function migrate(db:Database){
+  const sql=readFileSync(new URL('./migrations/001_initial.sql',import.meta.url),'utf8');
+  await db.transaction(async tx=>{for(const statement of sql.split(';').map(x=>x.trim()).filter(Boolean)) await tx.query(statement);if(!await one(tx,'SELECT version FROM schema_migrations WHERE version=?',['001']))await tx.query('INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)',['001',new Date().toISOString()]);});
++ if(!await one(db,'SELECT version FROM schema_migrations WHERE version=?',['002']))await db.transaction(async tx=>{
++ const second=readFileSync(new URL('./migrations/002_automation.sql',import.meta.url),'utf8');
++ for(const statement of second.split(';').map(x=>x.trim()).filter(Boolean))await tx.query(statement);
++ await tx.query('INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)',['002',new Date().toISOString()]);
++ });
+ }
+-if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){const db=await connect();await migrate(db);console.log('Migração 001 aplicada.',db.driver);await db.close();}
++if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){const db=await connect();await migrate(db);console.log('Migrações aplicadas.',db.driver);await db.close();}
+diff --git a/packages/database/migrations/002_automation.sql b/packages/database/migrations/002_automation.sql
+new file mode 100644
+index 0000000..eebbf79
+--- /dev/null
++++ b/packages/database/migrations/002_automation.sql
+@@ -0,0 +1,14 @@
++ALTER TABLE users ADD COLUMN access_profile TEXT NOT NULL DEFAULT '' CHECK(access_profile IN ('','OPERATOR'));
++CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id,id);
++CREATE TABLE user_barns (tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, barn_id TEXT NOT NULL, preferred INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,barn_id), FOREIGN KEY(tenant_id,user_id) REFERENCES users(tenant_id,id), FOREIGN KEY(tenant_id,barn_id) REFERENCES barns(tenant_id,id));
++CREATE TABLE population_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, barn_id TEXT NOT NULL, day TEXT NOT NULL, birds INTEGER NOT NULL CHECK(birds>0), source TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,barn_id,day), FOREIGN KEY(tenant_id,barn_id) REFERENCES barns(tenant_id,id));
++CREATE TABLE integration_sources (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, resource TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('manual','api','https')), format TEXT NOT NULL CHECK(format IN ('csv','xlsx')), mapping TEXT NOT NULL, endpoint TEXT NOT NULL DEFAULT '', secret TEXT, token_hash TEXT UNIQUE, interval_minutes INTEGER NOT NULL CHECK(interval_minutes>=15), active INTEGER NOT NULL DEFAULT 1, next_run_at TEXT NOT NULL, last_run_at TEXT, last_status TEXT, created_at TEXT NOT NULL, UNIQUE(tenant_id,id));
++CREATE TABLE import_runs (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, source_id TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, error TEXT, payload TEXT, started_at TEXT NOT NULL, finished_at TEXT, FOREIGN KEY(tenant_id,source_id) REFERENCES integration_sources(tenant_id,id));
++CREATE INDEX idx_import_history ON import_runs(tenant_id,source_id,started_at);
++CREATE TABLE imported_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, source_id TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(source_id,fingerprint), FOREIGN KEY(tenant_id,source_id) REFERENCES integration_sources(tenant_id,id));
++CREATE TABLE job_leases (id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at TEXT NOT NULL);
++CREATE TABLE report_schedules (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, frequency TEXT NOT NULL CHECK(frequency IN ('daily','weekly')), weekday INTEGER NOT NULL CHECK(weekday>=0 AND weekday<=6), send_time TEXT NOT NULL, timezone TEXT NOT NULL, barn_ids TEXT NOT NULL, indicators TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, last_slot TEXT, created_at TEXT NOT NULL, UNIQUE(tenant_id,id));
++CREATE TABLE report_recipients (tenant_id TEXT NOT NULL, schedule_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY(schedule_id,user_id), FOREIGN KEY(tenant_id,schedule_id) REFERENCES report_schedules(tenant_id,id), FOREIGN KEY(tenant_id,user_id) REFERENCES users(tenant_id,id));
++CREATE TABLE report_deliveries (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, schedule_id TEXT NOT NULL, user_id TEXT NOT NULL, slot TEXT NOT NULL, status TEXT NOT NULL, subject TEXT NOT NULL, html TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, sent_at TEXT, UNIQUE(schedule_id,user_id,slot), FOREIGN KEY(tenant_id,schedule_id) REFERENCES report_schedules(tenant_id,id), FOREIGN KEY(tenant_id,user_id) REFERENCES users(tenant_id,id));
++CREATE INDEX idx_report_queue ON report_deliveries(status,next_attempt_at);
++CREATE INDEX idx_sources_due ON integration_sources(active,next_run_at);
+diff --git a/packages/shared/resources.ts b/packages/shared/resources.ts
+index 48b2d63..bbf08bd 100644
+--- a/packages/shared/resources.ts
++++ b/packages/shared/resources.ts
+@@ -60,5 +60,5 @@ export function validate(name:string,input:any):Record<string,any>{
+  return data;
+ }
+ export const modules=['monitor','predict','energy','performance'];
+-export const roles=['OWNER','MANAGER','TECH','VIEWER'];
++export const roles=['OWNER','MANAGER','TECH','VIEWER','OPERATOR'];
+ export function parseJson<T=any>(v:any,fallback:T):T{try{return typeof v==='string'?JSON.parse(v):v??fallback;}catch{return fallback;}}
+diff --git a/scripts/seed.ts b/scripts/seed.ts
+index bb6e070..750deba 100644
+--- a/scripts/seed.ts
++++ b/scripts/seed.ts
+@@ -12,7 +12,7 @@ export async function seedDemo(db:Queryable,options:{reset?:boolean;tenantId?:st
+  await seedPlans(db);let tenant=options.tenantId||(await one(db,'SELECT id FROM tenants WHERE demo=1 LIMIT 1'))?.id;
+  if(tenant&&!options.reset)return {tenant_id:tenant,existing:true};
+  if(tenant&&options.reset){const t=await one(db,'SELECT demo FROM tenants WHERE id=?',[tenant]);if(t?.demo!==1)throw new Error('Reset permitido apenas para tenant de demonstração.');
+- for(const table of ['attachments','operation_logs','outbox','audit_logs','notifications','hourly_metrics','tag_latest','measurements','incidents','alert_rules','maintenance_plans','work_orders','downtimes','tags','gateways','energy_readings','meters','tariffs','invoices','production','costs','opportunities','flocks','equipment','barns','units','tickets'])await db.query(`DELETE FROM ${table} WHERE tenant_id=?`,[tenant]);
++ for(const table of ['report_deliveries','report_recipients','report_schedules','imported_records','import_runs','integration_sources','population_records','user_barns','attachments','operation_logs','outbox','audit_logs','notifications','hourly_metrics','tag_latest','measurements','incidents','alert_rules','maintenance_plans','work_orders','downtimes','tags','gateways','energy_readings','meters','tariffs','invoices','production','costs','opportunities','flocks','equipment','barns','units','tickets'])await db.query(`DELETE FROM ${table} WHERE tenant_id=?`,[tenant]);
+  }else{
+  tenant=id();await insert(db,'tenants',{id:tenant,name:'Granja Horizonte · Demo',timezone:'America/Sao_Paulo',demo:1,created_at:now()});
+  const plan=await one(db,"SELECT id FROM plans WHERE name='INTELLIGENCE'");
+diff --git a/scripts/tenant-data.ts b/scripts/tenant-data.ts
+index 729d8e4..c6d8942 100644
+--- a/scripts/tenant-data.ts
++++ b/scripts/tenant-data.ts
+@@ -5,12 +5,12 @@ import {randomUUID} from 'node:crypto';
+ const [action,tenantId,target]=process.argv.slice(2);
+ if(!['export','delete'].includes(action)||!tenantId)throw new Error('Uso: node --env-file=.env scripts/tenant-data.ts export TENANT_UUID arquivo.ndjson | delete TENANT_UUID CONFIRMAR_UUID');
+ const db=await connect();const tenant=await one(db,'SELECT * FROM tenants WHERE id=?',[tenantId]);if(!tenant)throw new Error('Empresa não encontrada.');
+-const tables=['attachments','operation_logs','hourly_metrics','tag_latest','measurements','incidents','alert_rules','maintenance_plans','work_orders','downtimes','tags','gateways','energy_readings','meters','tariffs','invoices','production','costs','opportunities','flocks','equipment','barns','units','tickets','notifications','outbox','audit_logs','charges','subscription_history','subscriptions','users'];
++const tables=['report_deliveries','report_recipients','report_schedules','imported_records','import_runs','integration_sources','population_records','user_barns','attachments','operation_logs','hourly_metrics','tag_latest','measurements','incidents','alert_rules','maintenance_plans','work_orders','downtimes','tags','gateways','energy_readings','meters','tariffs','invoices','production','costs','opportunities','flocks','equipment','barns','units','tickets','notifications','outbox','audit_logs','charges','subscription_history','subscriptions','users'];
+ if(action==='export'){
+  if(!target)throw new Error('Informe destino local protegido.');const file=createWriteStream(target,{flags:'wx',mode:0o600});
+  async function line(value:any){if(!file.write(JSON.stringify(value)+'\n'))await once(file,'drain');}
+  await line({table:'tenants',data:tenant});
+- for(const table of tables.filter(name=>name!=='outbox')){const order=table==='tag_latest'?'tag_id':table==='hourly_metrics'?'tag_id,hour,source,quality':'id';let offset=0;while(true){const rows=await db.query(`SELECT * FROM ${table} WHERE tenant_id=? ORDER BY ${order} LIMIT ? OFFSET ?`,[tenantId,500,offset]);if(!rows.length)break;for(const row of rows){for(const key of ['password_hash','mfa_secret','token_hash','mfa_last_step'])delete row[key];await line({table,data:row});}offset+=rows.length;}}
++ for(const table of tables.filter(name=>!['outbox','report_deliveries','import_runs'].includes(name))){const order=table==='user_barns'?'user_id,barn_id':table==='report_recipients'?'schedule_id,user_id':table==='tag_latest'?'tag_id':table==='hourly_metrics'?'tag_id,hour,source,quality':'id';let offset=0;while(true){const rows=await db.query(`SELECT * FROM ${table} WHERE tenant_id=? ORDER BY ${order} LIMIT ? OFFSET ?`,[tenantId,500,offset]);if(!rows.length)break;for(const row of rows){for(const key of ['secret','password_hash','mfa_secret','token_hash','mfa_last_step'])delete row[key];await line({table,data:row});}offset+=rows.length;}}
+  file.end();await once(file,'finish');console.log('Exportação concluída. Proteja o arquivo e entregue somente ao solicitante autorizado.');
+ }else{
+  if(target!==tenantId)throw new Error('Confirme repetindo o UUID exato como terceiro argumento. Faça backup e valide retenções antes.');
+-- 
+2.51.1
+

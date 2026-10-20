@@ -1,0 +1,661 @@
+From 04ec8dba39301b32d281038efa22eb3677efa29e Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 05:38:35 +0200
+Subject: [PATCH 3/4] test: verify automation migration HTTP and SMTP workflows
+ and document rollout
+
+---
+ .env.example                       |   4 +
+ README.md                          |   6 +-
+ docs/ARQUIVOS_2_0.md               |  50 +++++++++++
+ docs/ATUALIZACAO_2_0.md            | 129 +++++++++++++++++++++++++++++
+ docs/DEPLOY.md                     |   2 +-
+ docs/ENTREGA_2_0.md                |  49 +++++++++++
+ docs/RELATORIO_ENTREGA.md          |   2 +
+ docs/TESTES.md                     |   2 +
+ docs/verification/v2/build.txt     |  33 ++++++++
+ docs/verification/v2/tests.txt     |  67 +++++++++++++++
+ docs/verification/v2/typecheck.txt |   2 +
+ infrastructure/docker/Dockerfile   |   6 +-
+ package.json                       |   3 +-
+ tests/automation.test.ts           |  60 ++++++++++++++
+ tests/browser-v2.mjs               |  27 ++++++
+ tests/core.test.ts                 |   2 +-
+ tests/transport-migration.test.ts  |  28 +++++++
+ 17 files changed, 464 insertions(+), 8 deletions(-)
+ create mode 100644 docs/ARQUIVOS_2_0.md
+ create mode 100644 docs/ATUALIZACAO_2_0.md
+ create mode 100644 docs/ENTREGA_2_0.md
+ create mode 100644 docs/verification/v2/build.txt
+ create mode 100644 docs/verification/v2/tests.txt
+ create mode 100644 docs/verification/v2/typecheck.txt
+ create mode 100644 tests/automation.test.ts
+ create mode 100644 tests/browser-v2.mjs
+ create mode 100644 tests/transport-migration.test.ts
+
+diff --git a/.env.example b/.env.example
+index e1d10b3..492765f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -37,3 +37,7 @@ TRUST_PROXY=0
+ ENABLE_BILLING_WEBHOOK=false
+ WEB_PORT=3000
+ API_PORT=4000
++
++# HTTPS import sources: exact public DNS hostnames, comma-separated; no wildcards.
++# Keep empty to deny remote file downloads. Credentials are stored encrypted via MFA_ENCRYPTION_KEY.
++IMPORT_ALLOWED_HOSTS=
+diff --git a/README.md b/README.md
+index 70e5503..91455ca 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,8 @@
+ 
+ Aplicação B2B para granjas de postura: Monitor, Predict, Energy e Performance, com portal EWS, dados persistidos e demonstração isolada.
+ 
++**Atualização 2.0:** Modo Funcionário, integrações CSV/XLSX/API/HTTPS e relatórios por e-mail. Leia `docs/ATUALIZACAO_2_0.md` para atualizar um banco existente, configurar e conferir as evidências.
++
+ **Estado da entrega: versão funcional para desenvolvimento e demonstração. Ainda não homologada para operação comercial em produção.** Os testes de aplicação rodaram em SQLite local. PostgreSQL/Fastify em produção, Docker e navegador precisam passar pelos procedimentos fornecidos antes de um piloto real. Leia `docs/RELATORIO_ENTREGA.md` para distinguir implementação, teste e pendência.
+ 
+ ## Começar no seu computador
+@@ -11,7 +13,7 @@ Requisitos: Node.js 24, pnpm 11.25.0 e acesso ao registro npm para instalar depe
+ ```bash
+ corepack enable
+ corepack prepare pnpm@11.25.0 --activate
+-pnpm install --no-frozen-lockfile
++pnpm install --frozen-lockfile
+ ```
+ 
+ Copie `.env.example` para `.env` (no PowerShell: `Copy-Item .env.example .env`). Para uma demonstração local, mantenha:
+@@ -88,6 +90,6 @@ Não há conector Omron real habilitado. O modelo da CPU ainda é desconhecido.
+ 
+ ## Dependências e reprodutibilidade
+ 
+-O ambiente de construção tinha dependências de frontend em cache, mas não permitiu instalar toda a árvore de produção. Por isso não foi gerado um lockfile completo e confiável. A primeira instalação com acesso ao npm deve gerar `pnpm-lock.yaml`; revise, execute os testes e versione esse arquivo. Depois altere a instalação de CI/Docker para `--frozen-lockfile`. Não trate a imagem Docker como validada antes desse passo.
++O repositório contém `pnpm-lock.yaml`. A atualização 2.0 validou instalação com `pnpm install --frozen-lockfile --ignore-scripts`, TypeScript, build e testes com as versões fixadas. Use pnpm para o monorepo. Não atualize dependências junto desta migração sem nova homologação. Docker e PostgreSQL continuam exigindo validação no ambiente de destino.
+ 
+ A stack preferida foi adaptada: consultas SQL explícitas em vez de Prisma/Drizzle; CSS e componentes nativos em vez de Tailwind/shadcn; transições CSS em vez de Framer Motion; testes `node:test` em vez de Vitest. Essas diferenças são intencionais e estão descritas no relatório. Next.js, TypeScript, Zod, Recharts, Lucide, Fastify e PostgreSQL permanecem no projeto.
+diff --git a/docs/ARQUIVOS_2_0.md b/docs/ARQUIVOS_2_0.md
+new file mode 100644
+index 0000000..5cca71e
+--- /dev/null
++++ b/docs/ARQUIVOS_2_0.md
+@@ -0,0 +1,50 @@
++# Arquivos da atualização 2.0
++
++| Área | Alteração |
++|---|---|
++| API e banco | Perfil operador, atribuições, população, integrações, relatórios e transporte testável |
++| Frontend | Modo Funcionário, formulários administrativos, resumo diário, navegação e estilos |
++| Worker | Coleta HTTPS, agendamentos, fila de relatórios e retenção |
++| Scripts | Preservação das novas relações no reset e na portabilidade/exclusão |
++| Testes | Regressão, automação, migração, SMTP, HTTP e roteiro E2E |
++| Operação | Variáveis, build reproduzível e guias |
++
++## Lista exata
++
++- `.env.example`
++- `README.md`
++- `apps/api/src/app.ts`
++- `apps/api/src/automation-core.ts`
++- `apps/api/src/automation-routes.ts`
++- `apps/api/src/fastify-transport.ts`
++- `apps/api/src/safe-source.ts`
++- `apps/api/src/scheduled-reports.ts`
++- `apps/api/src/server.ts`
++- `apps/web/app/globals.css`
++- `apps/web/app/login/page.tsx`
++- `apps/web/components/Automation.tsx`
++- `apps/web/components/StaffMode.tsx`
++- `apps/web/components/Workspace.tsx`
++- `apps/web/lib/client.ts`
++- `apps/worker/automation.ts`
++- `apps/worker/index.ts`
++- `docs/ARQUIVOS_2_0.md`
++- `docs/ATUALIZACAO_2_0.md`
++- `docs/DEPLOY.md`
++- `docs/ENTREGA_2_0.md`
++- `docs/RELATORIO_ENTREGA.md`
++- `docs/TESTES.md`
++- `docs/verification/v2/build.txt`
++- `docs/verification/v2/tests.txt`
++- `docs/verification/v2/typecheck.txt`
++- `infrastructure/docker/Dockerfile`
++- `package.json`
++- `packages/database/migrate.ts`
++- `packages/database/migrations/002_automation.sql`
++- `packages/shared/resources.ts`
++- `scripts/seed.ts`
++- `scripts/tenant-data.ts`
++- `tests/automation.test.ts`
++- `tests/browser-v2.mjs`
++- `tests/core.test.ts`
++- `tests/transport-migration.test.ts`
+diff --git a/docs/ATUALIZACAO_2_0.md b/docs/ATUALIZACAO_2_0.md
+new file mode 100644
+index 0000000..089639a
+--- /dev/null
++++ b/docs/ATUALIZACAO_2_0.md
+@@ -0,0 +1,129 @@
++# EWS AgroIntelligence — atualização 2.0
++
++Esta atualização reduz digitação em três frentes: Modo Funcionário, reaproveitamento de dados externos e relatórios executivos. Mantém os quatro módulos e o portal EWS. Nenhum deploy foi realizado.
++
++## Atualizar a instalação existente
++
++1. Pare frontend, API e worker. Faça backup do banco e guarde a chave MFA existente. Não substitua `.env` nem apague `.data`.
++2. Obtenha a branch `feat/automacao-operacional-v2` e confira as alterações locais antes de trocar de branch.
++3. Com Node 24 e pnpm 11.25.0, na raiz:
++
++```bash
++pnpm install --frozen-lockfile
++pnpm db:migrate
++pnpm typecheck
++pnpm test
++pnpm build
++pnpm dev
++```
++
++A migração 002 é aditiva, transacional e registrada em `schema_migrations`. Não reconstrói a tabela de usuários nem descarta produção ou sessões. Pode ser executada novamente. **Não é necessário rodar seed nem resetar a demo ao atualizar.** A migração deve rodar uma vez por implantação, antes de iniciar os processos; não execute migradores simultâneos.
++
++A permissão Operador é armazenada como `users.access_profile=OPERATOR`, sobre a função legada VIEWER, evitando reconstruir o CHECK antigo em SQLite. A API transforma esse perfil no papel efetivo OPERATOR e bloqueia todas as rotas administrativas/financeiras, inclusive leitura. Não altere apenas o campo `role` diretamente no banco: use Equipe e acessos.
++
++## Modo Funcionário
++
++- Gestor: abra **Equipe e acessos**, crie um usuário Operador e informe uma senha inicial exclusiva. Convites dependem de SMTP.
++- Abra **Equipe operacional**, selecione o usuário, marque os galpões permitidos e escolha o habitual. Operadores e técnicos sem atribuição veem uma orientação para procurar o gestor.
++- Confirme a população atual de cada galpão. Não presumimos que a quantidade legada está atualizada. A confirmação é válida por até 30 dias para reaproveitamento; uma alteração de aves exige novo registro. Há apenas uma confirmação por galpão/data; valores conflitantes não são substituídos automaticamente.
++- O operador entra normalmente e é direcionado para `/app/staff`. Ele informa ovos ou um problema; não preenche energia nem custos. A data usa o fuso da granja. O galpão habitual vem preenchido.
++- Operadores registram somente o dia atual. A chave galpão/data evita duplicação: mesmo valor retorna confirmação idempotente, valor diferente exige gestor. O gestor pode marcar “Confirmar correção” e informar uma data anterior.
++- Ocorrências entram na mesma tabela usada pelo Monitor, com categoria, descrição e equipamento autorizado. Elas **não** acionam controle industrial.
++- Ordens: no cadastro existente, use o **e-mail ou ID do técnico** em Responsável e avance a ordem para Atribuída. O técnico vê apenas suas ordens dos galpões permitidos, inicia, marca o checklist original, registra duração/relatório e conclui. O operador pode consultar tarefas atribuídas, mas não executa ordens técnicas.
++- O histórico mostra até 30 lançamentos recentes. A conclusão de hoje é consultada separadamente e não fica limitada a esses 30 registros.
++- O link direto do galpão, disponível em Equipe operacional, pode ser impresso em QR Code. Continua exigindo login e autorização; o QR não contém credencial.
++
++## Integrações de dados
++
++Acesse **Configurações → Integrações de dados**, também disponível na navegação.
++
++### Recursos e formatos
++
++| Destino | Campos | Observações |
++|---|---|---|
++| Produção | barn_id, day, eggs, birds | birds opcional se houver população confirmada válida para a data |
++| População | barn_id, day, birds | Atualiza a população do galpão sem retroagir sobre o último registro válido |
++| Energia | meter_id, day, kwh, evidence | Consumo diário, não contador acumulado; não usa horas de motores |
++| Custos | name, barn_id, day, category, amount_cents | Galpão opcional; categoria Ração, Mão de obra, Transporte ou Outros; centavos inteiros |
++
++O formulário associa campos do banco aos nomes exatos das colunas. Os modelos ficam salvos por empresa. IDs dos galpões e medidores aparecem em “Referências para o arquivo”. Referências de outra empresa são rejeitadas. Datas são AAAA-MM-DD; CSV usa vírgula como separador, números com ponto decimal e aspas quando necessário. XLSX lê a primeira aba, aceita datas seriais em campos mapeados para `day` e rejeita fórmulas. Máximo: 1.000 linhas e arquivo de 1,5 MB; XLSX tem limites adicionais de expansão.
++
++Exemplo de CSV para o mapeamento inicial:
++
++```csv
++galpao,data,ovos,aves
++UUID_DO_GALPAO,2026-10-19,19500,22000
++```
++
++**Validar sem gravar** executa as mesmas validações/transações e desfaz tudo. **Importar** grava o lote integralmente ou nenhum registro. O histórico inclui resultado e erro com a linha. A origem é IMPORTED; em empresa demo, SIMULATED. Informações manuais permanecem MANUAL, e leituras do gateway continuam distinguindo MEASURED.
++
++Deduplicação: o conteúdo mapeado de cada registro é identificado por hash dentro da fonte; reenvio do mesmo arquivo não duplica registros. Produção e energia também validam suas chaves diárias entre fontes. Conflitos com valores existentes exigem revisão/correção autorizada, sem sobrescrita silenciosa. Para custos, mantenha uma fonte estável e descrições que identifiquem cada lançamento: dois custos com todos os campos idênticos na mesma fonte são tratados como repetição. Não troque de fonte para tentar reprocessar um mesmo custo.
++
++Arquivos com falha ficam retidos no banco por até 7 dias para reprocessamento; após isso, envie novamente. Arquivos concluídos são removidos do histórico, preservando metadados/hashes. Os dados ficam sujeitos às mesmas regras de backup/acesso do banco. Não envie senhas ou dados desnecessários em planilhas.
++
++### API de envio
++
++Crie uma fonte do tipo API. Copie o token exibido uma vez. Ele é armazenado apenas como hash e pode ser rotacionado; o anterior deixa de funcionar. O token identifica a fonte e a empresa, sem aceitar `tenant_id` escolhido pelo remetente.
++
++```http
++POST /api/import-feed
++Authorization: Bearer TOKEN_DA_FONTE
++Content-Type: application/json
++
++{"rows":[{"galpao":"UUID_DO_GALPAO","data":"2026-10-19","ovos":19500,"aves":22000}]}
++```
++
++Os nomes das propriedades seguem o mapeamento da fonte. Alternativamente envie `{"content":"CONTEUDO_CSV"}` ou XLSX em Base64 conforme o formato configurado. Não envie `rows` e `content` juntos. Fontes desativadas e assinaturas suspensas são rejeitadas. A API pública não usa cookie/CSRF, mas exige Bearer, limite de corpo, validação e limite de requisições.
++
++### Arquivo HTTPS programado
++
++1. Configure uma chave MFA de 64 caracteres hexadecimais em `MFA_ENCRYPTION_KEY` e mantenha-a estável. Credenciais HTTPS usam a mesma criptografia AES-GCM dos segredos MFA.
++2. Acrescente ao `.env` do worker os **hosts exatos** permitidos:
++
++```dotenv
++IMPORT_ALLOWED_HOSTS=exportacao.seu-fornecedor.com,arquivos.sua-granja.com
++```
++
++3. Crie a fonte HTTPS, informe URL sem query string, formato, token Bearer opcional, mapeamento e intervalo de 15 minutos a 7 dias. A URL é um arquivo fixo que o fornecedor atualiza.
++4. Mantenha o worker ativo. “Sincronizar” antecipa a próxima execução. Fonte desativada não é coletada.
++
++O downloader exige TLS válido, porta 443, hostname autorizado e DNS resolvendo exclusivamente IPv4 públicos. Recusa IP literal, credenciais/query na URL, IPs privados/reservados e redirecionamentos. A conexão usa o endereço DNS já validado, mantendo SNI/verificação do certificado, para evitar troca de DNS entre validação e conexão. Timeout total de requisição: 15 s; limite de corpo: 1,5 MB. O destino precisa aceitar Bearer; endpoints com autenticação distinta precisam de adaptação explícita.
++
++Nesta versão **não há conector SFTP, ERP, Google Drive ou Omron**. O requisito inicial de arquivo programado foi implementado pela opção HTTPS. Os conectores futuros podem usar a mesma validação/transação e os mesmos registros.
++
++## Relatórios programados
++
++Abra **Relatórios programados** pela navegação ou Configurações. Escolha frequência, horário/fuso, galpões, indicadores e destinatários. Destinatários precisam ser usuários ativos OWNER ou MANAGER da mesma empresa; o acesso é revalidado imediatamente antes de cada envio. Não basta informar um e-mail arbitrário.
++
++- Diário: dia anterior completo. Semanal: sete dias anteriores, no dia da semana configurado.
++- Nenhum galpão selecionado: toda a granja; medição geral não é rateada nos relatórios por galpão.
++- Inclui ovos por ave-dia, produção por galpão, energia/tarifa, comparações quando há cobertura compatível, ocorrências e ordens. Estados de equipamentos e pendências são atuais, identificados como tal.
++- Comparações sem base positiva ou com registros faltantes ficam indisponíveis. População diária vem dos registros de produção. Aumento de energia acima de 20% gera ponto de investigação, não diagnóstico nem promessa de economia.
++- O e-mail é HTML responsivo, com identificação explícita de demonstração e “Sem dados”. A prévia HTML pode ser baixada. O PDF sob demanda continua em Relatórios, com autenticação; não são enviados anexos PDF automaticamente nesta versão.
++- SMTP usa a configuração já existente (`SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`). Exige TLS no worker; testes locais de SMTP não representam entrega na caixa de entrada de um provedor.
++- Sem SMTP, relatórios podem ficar pendentes na fila. Sem agendamentos, nenhuma mensagem de relatório é criada.
++- Há chave única por agendamento/destinatário/data local, locks com vencimento no banco e Message-ID estável. Falhas têm até cinco tentativas com espera crescente; o histórico permite nova tentativa controlada.
++- SMTP não oferece exatamente uma entrega: queda do processo após aceitação pelo servidor e antes da confirmação no banco pode causar reenvio. Não prometemos ausência absoluta de duplicatas. Reagendamento não gera outro envio para o mesmo destinatário na mesma data já processada.
++- Um relatório pendente que perdeu destinatário autorizado ou foi desativado é cancelado. O HTML enviado é retido por 30 dias; depois o worker limpa o corpo e mantém metadados. Não há envio WhatsApp.
++
++## Operação e produção
++
++Execute uma instância do worker inicialmente. Locks por execução evitam concorrência nas novas tarefas e se recuperam após 10 minutos de interrupção. O worker identifica importações interrompidas há mais de 15 minutos para reprocessamento. Para aumentar concorrência ou volume, homologue PostgreSQL e dimensionamento antes.
++
++No Docker, o worker já possui rede de saída para HTTPS/SMTP; banco e API continuam internos. O Dockerfile agora copia o lockfile e usa instalação congelada. Antes da atualização em produção: backup restaurável, migração em homologação, testes PostgreSQL, validação da imagem, certificados, origem HTTPS, chave MFA e SMTP. Consulte também os guias existentes de deploy, HTTPS e backup.
++
++Na Vercel, mantenha frontend separado da API/worker e configure o endereço interno/proxy conforme o guia original. Tarefas programadas não rodam no frontend da Vercel; precisam do worker persistente na VPS.
++
++## Verificação desta entrega
++
++Consulte `verification/v2/` e `ENTREGA_2_0.md`. Não confunda build bem-sucedido com homologação visual ou industrial. A inspeção visual deste ambiente foi bloqueada pela política do navegador na sessão; não houve tentativa de contorná-la. O roteiro Playwright foi acrescentado para execução local:
++
++```bash
++pnpm exec playwright install chromium
++pnpm dev
++# Em outro terminal:
++pnpm test:e2e
++pnpm test:e2e:v2
++```
++
++O roteiro V2 usa somente empresa demo, cria fixtures, testa 360, 390, 768, 1024 e 1440 px, produção, ocorrência, acesso financeiro negado e novas páginas. Ao terminar, suspende o operador criado; um reset de demo pode limpar os demais registros. Não execute em uma demo compartilhada com demonstração comercial em andamento.
+diff --git a/docs/DEPLOY.md b/docs/DEPLOY.md
+index 3d4c779..5706851 100644
+--- a/docs/DEPLOY.md
++++ b/docs/DEPLOY.md
+@@ -6,7 +6,7 @@
+ 
+ 1. Instale Docker Engine e o plugin Compose pelo repositório oficial para Ubuntu: https://docs.docker.com/engine/install/ubuntu/ . Confirme `docker version` e `docker compose version`.
+ 2. Copie o projeto para uma pasta dedicada, com usuário de implantação e acesso SSH restrito.
+-3. Faça a primeira instalação com acesso ao npm, gere o lockfile e rode os testes. O Dockerfile inicial usa `--no-frozen-lockfile`; depois da homologação, copie o lockfile e use instalação congelada.
++3. Faça a primeira instalação com acesso ao npm, gere o lockfile e rode os testes. O Dockerfile da atualização 2.0 copia `pnpm-lock.yaml` e usa `--frozen-lockfile`. A instalação congelada foi verificada; a imagem Docker ainda precisa ser homologada.
+ 4. Copie `.env.example` para `.env` e proteja com `chmod 600 .env`.
+ 5. Gere senhas e chave MFA sem valores padrão. Use senha hexadecimal em `POSTGRES_PASSWORD`, pois ela compõe a URL do banco. Configure:
+ 
+diff --git a/docs/ENTREGA_2_0.md b/docs/ENTREGA_2_0.md
+new file mode 100644
+index 0000000..bfc8303
+--- /dev/null
++++ b/docs/ENTREGA_2_0.md
+@@ -0,0 +1,49 @@
++# Entrega da atualização 2.0
++
++Base: commit `8f0e198d9d63224edf5f0f43e2a9aaad19132a52` do repositório oficial. Branch: `feat/automacao-operacional-v2`. Não houve merge em main nem implantação em produção.
++
++## Implementado
++
++- Modo Funcionário próprio, com ações grandes, identificação, galpão habitual/atribuído, data no fuso da granja, produção, ocorrências com categorias, tarefas e checklist, histórico e conclusão diária.
++- Perfil Operador efetivamente restrito no backend. QR/link de galpão preservado após login sem conceder acesso. Reutilização de população confirmada, controle de data e correção por gestor.
++- Centro de integrações com modelos de colunas por empresa, CSV/XLSX, pré-validação sem gravação, importação transacional, histórico, reprocessamento e origem dos dados.
++- API Bearer por fonte/empresa, token com hash e rotação. Downloader HTTPS programado com allowlist, DNS público validado e fixado na conexão, TLS, limites, timeout e recusa de redirects. Credenciais cifradas.
++- Agendamentos de relatório diário/semanal, fuso, horário, galpões, indicadores, destinatários autorizados, prévia HTML, fila SMTP, histórico e reenvio controlado. Comparação por período com verificação de cobertura. PDF sob demanda preservado.
++- Visão diária do proprietário com produção registrada/pendente, última energia e estado das integrações, usando os registros originais dos módulos.
++- Migração 002 aditiva; scripts de demo e portabilidade/exclusão atualizados para os vínculos novos. Exportação omite credenciais e conteúdos das filas.
++- Navegação, tema claro/escuro, estilos responsivos e formulários das novas telas. Portal EWS, MFA, sessões, CSRF e gateway de somente leitura preservados.
++
++## Executado e verificado
++
++| Verificação | Resultado |
++|---|---|
++| Instalação pnpm congelada com scripts desativados | Concluída usando o lockfile do repositório |
++| TypeScript API, banco, worker, scripts, testes e frontend | Sem diagnósticos |
++| Testes automatizados | **58 aprovados, 0 falhas** (36 existentes + 22 novos) |
++| Build Next.js Turbopack | Compilado com sucesso |
++| Build oficial `pnpm build` (Webpack) | Concluído, incluindo standalone |
++| Migração 001 preenchida → 002 e repetição | Preservou usuário, hash de senha, sessão e quantidade de registros de produção |
++| Operador/empresa/galpão | Acesso financeiro negado; empresa e galpão não atribuídos rejeitados |
++| CSV/XLSX | Mapeamento, transação, prévia com rollback, fórmula inválida, duplicidade e conflito |
++| Agendamento HTTPS | Worker com transporte de download controlado no teste; intervalo, segredo cifrado e exclusão concorrente |
++| Proteção SSRF | URLs/hosts/IPs bloqueados; resolução localhost recusada antes de conectar |
++| Relatórios | Períodos, comparação, ausência de dados, escopo, demo, horário/fuso, dia semanal e deduplicação |
++| SMTP | Envio HTML real para servidor SMTP de teste em loopback; falha/retry; destinatário revalidado |
++| Fastify | Requisições HTTP reais em loopback: saúde, sessão demo, CSRF, autenticação e PDF binário |
++
++Evidências: `docs/verification/v2/`. O teste de SMTP não enviou mensagem a uma pessoa nem usou credenciais externas. O teste de downloader usa arquivo controlado; não representa homologação de um endpoint de cliente.
++
++## Pendências de homologação e limites explícitos
++
++- PostgreSQL e Docker não estavam instalados neste ambiente. SQL/migração e imagem precisam ser executados no ambiente de homologação. A suíte core suporta `agro_test`; os novos testes usam SQLite.
++- Navegador: política da sessão bloqueou acesso ao preview. Não foi contornada. Não afirmamos validação visual, teclado, iPhone/Android real ou ausência de overflow observada. `tests/browser-v2.mjs` foi entregue, mas não executado.
++- SMTP do cliente, entregabilidade, DNS/certificado do endpoint HTTPS e volumes reais exigem credenciais, dados e ensaios do ambiente de destino.
++- Arquivos programados usam HTTPS; SFTP/ERPs/Drive não foram implementados. WhatsApp e Omron real continuam pendentes e não são simulados como integrações prontas.
++- Os relatórios enviados são HTML. PDF continua sob demanda dentro do sistema, sem anexo automático.
++- População confirmada exige atualização do gestor ou fonte de importação; não é inferida do funcionamento de motores ou da produção. Correções conflitantes e dados ausentes exigem revisão humana.
++- A fila reduz duplicatas por chave única, lease e Message-ID, mas SMTP mantém uma janela de reenvio se o processo cair após aceitação e antes de registrar sucesso.
++- Comece com uma instância do worker e homologue carga/retentividade no PostgreSQL. Esta atualização não certifica capacidade de VPS nem conclui os itens comerciais não relacionados listados no relatório original.
++
++## Como usar
++
++Siga `ATUALIZACAO_2_0.md`: contém migração de instalação existente, guia do funcionário, atribuição de tarefas, mapeamentos, API, HTTPS, SMTP, programação e passos de produção. `ARQUIVOS_2_0.md` lista todos os arquivos alterados/adicionados.
+diff --git a/docs/RELATORIO_ENTREGA.md b/docs/RELATORIO_ENTREGA.md
+index 0732ab8..85a7dab 100644
+--- a/docs/RELATORIO_ENTREGA.md
++++ b/docs/RELATORIO_ENTREGA.md
+@@ -1,3 +1,5 @@
++> Relatório histórico da versão inicial. As alterações e verificações da atualização 2.0 estão em `ENTREGA_2_0.md`.
++
+ # Relatório de entrega — EWS AgroIntelligence
+ 
+ Data: 19/10/2026. Versão: 0.1.0. Base: especificação anexada e PDF de concepção, com quatro módulos e princípios industriais de somente leitura.
+diff --git a/docs/TESTES.md b/docs/TESTES.md
+index b273e9d..96ed57d 100644
+--- a/docs/TESTES.md
++++ b/docs/TESTES.md
+@@ -1,3 +1,5 @@
++> Para a atualização 2.0, veja `ENTREGA_2_0.md` e as evidências em `verification/v2/`. O conteúdo abaixo registra a entrega inicial.
++
+ # Testes e verificação
+ 
+ ## Executados neste ambiente
+diff --git a/docs/verification/v2/build.txt b/docs/verification/v2/build.txt
+new file mode 100644
+index 0000000..06cdbdf
+--- /dev/null
++++ b/docs/verification/v2/build.txt
+@@ -0,0 +1,33 @@
++$ pnpm --filter @ews/web build
++$ node scripts/run-next.mjs build
++▲ Next.js 16.3.4 (webpack)
++✓ Running next.config.mjs took 11ms
++- Experiments (use with caution):
++  · cpus: 2
++
++  Creating an optimized production build ...
++✓ Compiled successfully in 7.5s
++  Running TypeScript ...
++  Finished TypeScript in 3.4s ...
++  Collecting page data using 2 workers ...
++  Generating static pages using 2 workers (0/7) ...
++  Generating static pages using 2 workers (1/7) 
++  Generating static pages using 2 workers (3/7) 
++  Generating static pages using 2 workers (5/7) 
++✓ Generating static pages using 2 workers (7/7) in 384ms
++  Finalizing page optimization ...
++  Collecting build traces ...
++
++Route (app)
++┌ ○ /
++├ ○ /_not-found
++├ ƒ /app/[[...slug]]
++├ ○ /login
++├ ○ /reset
++├ ○ /robots.txt
++└ ○ /sitemap.xml
++
++
++○  (Static)   prerendered as static content
++ƒ  (Dynamic)  server-rendered on demand
++
+diff --git a/docs/verification/v2/tests.txt b/docs/verification/v2/tests.txt
+new file mode 100644
+index 0000000..417b306
+--- /dev/null
++++ b/docs/verification/v2/tests.txt
+@@ -0,0 +1,67 @@
++$ node --experimental-strip-types --test tests/*.test.ts
++✔ additive migration preserves existing production and is repeatable (656.225661ms)
++✔ operator sees no financial or management APIs, even with forged tenant header (2.008842ms)
++✔ assignment validates company and restricts staff barns (15.420805ms)
++✔ staff production requires confirmed population, reuses birds, rejects duplicate conflicts and past dates (7.184764ms)
++✔ staff incident persists in Monitor and refuses another company (1.739696ms)
++✔ technician completes only assigned task with original checklist (4.607124ms)
++✔ CSV mapping preview rolls back, import is atomic and repeat is deduplicated (7.063171ms)
++✔ XLSX custom headers import and formulas fail without writes (16.96101ms)
++✔ API token scoped to one source and tenant, rotation revokes old credential (3.437578ms)
++✔ SSRF policy rejects private/reserved addresses, URL secrets and arbitrary hosts (4.761707ms)
++✔ scheduled import advances next run, encrypts secret and excludes concurrent leases (8.974145ms)
++✔ report recipients reject foreign companies and operators (4.090674ms)
++✔ executive report uses comparable periods, no data labels and selected scope (7.531699ms)
++✔ schedule is idempotent per local date and concurrent invocations (3.388905ms)
++✔ delivery retries failures then sends HTML through local SMTP test server (63.507054ms)
++✔ delivery revalidates recipient role immediately before sending (4.34056ms)
++✔ daily dashboard reports persisted staff/import records in same tables (2.339952ms)
++✔ disabled integration cannot accept an API import and failed reprocessing stays atomic (2.893417ms)
++✔ weekly schedules honor timezone, weekday and configured time (13.354216ms)
++✔ demo reports retain explicit simulated label and restricted indicators (3.252569ms)
++✔ migration is repeatable (450.964412ms)
++✔ password hashing and wrong password (317.852181ms)
++✔ RFC 6238 SHA1 vector, encryption and replay protection (1.434175ms)
++✔ authentication and invalid credentials (81.431988ms)
++✔ CSRF and foreign origin rejected (0.701258ms)
++✔ viewer cannot modify resources (1.15918ms)
++✔ tenant IDs cannot be overridden by client headers (0.647267ms)
++✔ tenant isolation in reads, updates and foreign keys (2.534676ms)
++✔ CRUD persistence, filtering, sorting and audit (2.115202ms)
++✔ create normalized operational graph (4.081901ms)
++✔ ingestion deduplicates retries and rejects sequence collisions (2.922661ms)
++✔ ingestion is atomic for mixed valid and invalid rows (0.932918ms)
++✔ units, sources, timestamp and range validation (2.220592ms)
++✔ rule triggers once, hysteresis rearms after reset (5.50564ms)
++✔ minimum duration, silence and gap reset decisions (0.268325ms)
++✔ stale data never reports operational (0.130497ms)
++✔ gateway token rotation revokes old identity (1.281364ms)
++✔ work order state machine requires assignee, checklist and report (4.242863ms)
++✔ tariff overlaps rejected and money calculation uses cents (1.391861ms)
++✔ energy and production KPI requires matching scope (17.047481ms)
++✔ global and barn energy measurements cannot double count (1.067512ms)
++✔ CSV import validates atomically and protects CSV formulas (2.757102ms)
++✔ verified gains require documented evidence and baseline (0.58267ms)
++✔ backend plan gating and suspension (0.645875ms)
++✔ reports and exports are authenticated and tenant scoped (4.972465ms)
++✔ public leads persist and are not accessible to tenants (0.681739ms)
++✔ buffer persists, retries and removes only acknowledged batches (11.387478ms)
++✔ demo reset cannot affect real tenants (15.400124ms)
++✔ session revocation on logout (0.506985ms)
++✔ XLSX first sheet import, serial dates and formula rejection (21.419029ms)
++✔ binary PDF export produces valid pages (45.290043ms)
++✔ attachments validate content and tenant ownership (159.596774ms)
++✔ availability and MTBF only with complete daily coverage (3.143494ms)
++✔ billing webhook HMAC, stale timestamps, idempotency and payload conflict (1.642709ms)
++✔ platform commercial data excludes demo and permits subscription administration (145.636094ms)
++✔ tenant CLI excludes credentials, requires exact confirmation and preserves other companies (638.459065ms)
++✔ 002 upgrades populated 001 without rewriting users, sessions or production (129.349592ms)
++✔ Fastify real HTTP serves demo, enforces CSRF, restricts staff and returns binary PDF (275.743756ms)
++ℹ tests 58
++ℹ suites 0
++ℹ pass 58
++ℹ fail 0
++ℹ cancelled 0
++ℹ skipped 0
++ℹ todo 0
++ℹ duration_ms 1597.854484
+diff --git a/docs/verification/v2/typecheck.txt b/docs/verification/v2/typecheck.txt
+new file mode 100644
+index 0000000..137e172
+--- /dev/null
++++ b/docs/verification/v2/typecheck.txt
+@@ -0,0 +1,2 @@
++$ node node_modules/typescript/bin/tsc --noEmit && pnpm --filter @ews/web typecheck
++$ node node_modules/typescript/bin/tsc --noEmit
+diff --git a/infrastructure/docker/Dockerfile b/infrastructure/docker/Dockerfile
+index cbad2f9..f1f5d0b 100644
+--- a/infrastructure/docker/Dockerfile
++++ b/infrastructure/docker/Dockerfile
+@@ -4,9 +4,9 @@ ENV PATH=$PNPM_HOME:$PATH
+ RUN corepack enable && corepack prepare pnpm@11.25.0 --activate
+ WORKDIR /app
+ FROM base AS dependencies
+-COPY package.json pnpm-workspace.yaml ./
++COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+ COPY apps/web/package.json ./apps/web/package.json
+-RUN pnpm install --no-frozen-lockfile
++RUN pnpm install --frozen-lockfile
+ FROM dependencies AS source
+ COPY . .
+ FROM source AS web-build
+@@ -33,4 +33,4 @@ USER node
+ CMD ["node","apps/worker/index.ts"]
+ FROM source AS test
+ ENV NODE_ENV=test
+-CMD ["node","--test","tests/core.test.ts"]
++CMD ["node","--test","tests/core.test.ts","tests/automation.test.ts","tests/tenant-data.test.ts","tests/transport-migration.test.ts"]
+diff --git a/package.json b/package.json
+index c1baefc..8be42e4 100644
+--- a/package.json
++++ b/package.json
+@@ -19,7 +19,8 @@
+     "test:e2e": "node tests/browser.mjs",
+     "test:load": "node tests/load.mjs",
+     "build": "pnpm --filter @ews/web build",
+-    "typecheck": "node node_modules/typescript/bin/tsc --noEmit && pnpm --filter @ews/web typecheck"
++    "typecheck": "node node_modules/typescript/bin/tsc --noEmit && pnpm --filter @ews/web typecheck",
++    "test:e2e:v2": "node tests/browser-v2.mjs"
+   },
+   "dependencies": {
+     "fastify": "5.12.7",
+diff --git a/tests/automation.test.ts b/tests/automation.test.ts
+new file mode 100644
+index 0000000..c92ec91
+--- /dev/null
++++ b/tests/automation.test.ts
+@@ -0,0 +1,60 @@
++import {test,before,after} from 'node:test';
++import assert from 'node:assert/strict';
++import {randomUUID,randomBytes} from 'node:crypto';
++import {createServer} from 'node:net';
++import nodemailer from 'nodemailer';
++import JSZip from 'jszip';
++import {connect,insert,one,update} from '../packages/database/db.ts';
++import type {Database,Row} from '../packages/database/db.ts';
++import {migrate} from '../packages/database/migrate.ts';
++import {seedPlans} from '../scripts/seed.ts';
++import {createApp} from '../apps/api/src/app.ts';
++import {passwordHash,hash} from '../apps/api/src/security.ts';
++import {localClock,lease} from '../apps/api/src/automation-core.ts';
++import {allowedEndpoint,publicIPv4,fetchSource} from '../apps/api/src/safe-source.ts';
++import {scheduleReports,deliverReports,executiveReport} from '../apps/api/src/scheduled-reports.ts';
++import {automationTick} from '../apps/worker/automation.ts';
++let db:Database,app:ReturnType<typeof createApp>,a:string,b:string,barn:string,otherBarn:string,equipment:string,owner:Row,operator:Row,tech:Row,foreign:Row,source:string,apiToken:string,schedule:string;
++const password=randomBytes(20).toString('hex'),at=()=>new Date().toISOString(),today=()=>localClock('America/Sao_Paulo').day;
++let counter=0;
++async function call(method:string,url:string,body?:any,auth:Row|null=owner,extra:Row={}){return app.dispatch({method,url,body,headers:{origin:'http://localhost:3000',cookie:auth?.cookie,'x-csrf-token':auth?.csrf,...extra},ip:'automation-'+(++counter)});}
++async function user(tenant:string,role:string){const id=randomUUID(),email=id+'@example.invalid';await insert(db,'users',{id,tenant_id:tenant,name:role,email,password_hash:passwordHash(password),role:role==='OPERATOR'?'VIEWER':role,access_profile:role==='OPERATOR'?'OPERATOR':'',created_at:at()});const r=await call('POST','/api/auth/login',{email,password},null);assert.equal(r.status,200);return {id,email,cookie:r.headers['set-cookie'].split(';')[0],csrf:r.body.csrf};}
++async function create(name:string,body:Row){const r=await call('POST','/api/data/'+name,body);assert.equal(r.status,200,JSON.stringify(r.body));return r.body;}
++async function integration(overrides:Row={}){const r=await call('POST','/api/integrations',{name:'Importação teste',resource:'production',kind:'manual',format:'csv',mapping:{barn_id:'galpao',day:'data',eggs:'ovos',birds:'aves'},endpoint:'',interval_minutes:15,active:1,...overrides});assert.equal(r.status,200,JSON.stringify(r.body));return r.body;}
++before(async()=>{process.env.MFA_ENCRYPTION_KEY=randomBytes(32).toString('hex');db=await connect({driver:'sqlite',path:':memory:'});await migrate(db);await seedPlans(db);const plan=await one(db,"SELECT id FROM plans WHERE name='INTELLIGENCE'");a=randomUUID();b=randomUUID();for(const [id,name]of [[a,'Granja A'],[b,'Segredo B']]){await insert(db,'tenants',{id,name,timezone:'America/Sao_Paulo',created_at:at()});await insert(db,'subscriptions',{id:randomUUID(),tenant_id:id,plan_id:plan.id,status:'active',started_at:at()});}app=createApp(db);owner=await user(a,'OWNER');operator=await user(a,'OPERATOR');tech=await user(a,'TECH');foreign=await user(b,'OWNER');const unit=await create('units',{name:'Unidade',address:''});barn=(await create('barns',{name:'Galpão A',unit_id:unit.id,capacity:1000,birds:100})).id;otherBarn=(await create('barns',{name:'Galpão não atribuído',unit_id:unit.id,capacity:1000,birds:100})).id;equipment=(await create('equipment',{name:'Motor',barn_id:barn,category:'Motor'})).id;});
++after(async()=>db.close());
++test('additive migration preserves existing production and is repeatable',async()=>{await insert(db,'production',{id:randomUUID(),tenant_id:a,barn_id:barn,day:'2026-01-01',eggs:90,birds:100,source:'MANUAL',created_at:at()});await migrate(db);assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM production')).n),1);});
++test('operator sees no financial or management APIs, even with forged tenant header',async()=>{for(const path of ['/api/dashboard','/api/data/costs','/api/users','/api/integrations','/api/report-schedules','/api/report.pdf','/api/resources'])assert.equal((await call('GET',path,undefined,operator,{'x-tenant-id':b})).status,403,path);assert.equal((await call('GET','/api/auth/me',undefined,operator)).body.user.role,'OPERATOR');});
++test('assignment validates company and restricts staff barns',async()=>{assert.equal((await call('PUT','/api/staff/assignments/'+foreign.id,{barn_ids:[barn],preferred:barn})).status,404);assert.equal((await call('PUT','/api/staff/assignments/'+operator.id,{barn_ids:[barn],preferred:barn})).status,200);const r=await call('GET','/api/staff',undefined,operator);assert.deepEqual(r.body.barns.map((b:Row)=>b.id),[barn]);assert.equal((await call('POST','/api/staff/production',{barn_id:otherBarn,day:today(),eggs:30},operator)).status,403);});
++test('staff production requires confirmed population, reuses birds, rejects duplicate conflicts and past dates',async()=>{const body={barn_id:barn,day:today(),eggs:80};assert.equal((await call('POST','/api/staff/production',body,operator)).status,400);assert.equal((await call('POST','/api/population',{barn_id:barn,day:today(),birds:100})).status,200);const r=await call('POST','/api/staff/production',body,operator);assert.equal(r.status,200);assert.equal(r.body.birds,100);assert.equal(r.body.source,'MANUAL');assert.equal((await call('POST','/api/staff/production',body,operator)).body.duplicate,true);assert.equal((await call('POST','/api/staff/production',{...body,eggs:81,correct:true},operator)).status,409);assert.equal((await call('POST','/api/staff/production',{...body,day:'2026-01-02'},operator)).status,403);assert.equal((await call('POST','/api/staff/production',{...body,eggs:81,correct:true})).status,200);assert.equal((await call('GET','/api/staff',undefined,operator)).body.barns[0].done,true);});
++test('staff incident persists in Monitor and refuses another company',async()=>{const body={equipment_id:equipment,category:'Ruído incomum',description:'Motor vibrando'};assert.equal((await call('POST','/api/staff/incidents',body,operator)).status,200);assert.equal((await call('GET','/api/data/incidents')).body.items[0].title,'Ruído incomum: Motor vibrando');assert.equal((await call('POST','/api/staff/incidents',body,foreign)).status,404);});
++test('technician completes only assigned task with original checklist',async()=>{await call('PUT','/api/staff/assignments/'+tech.id,{barn_ids:[barn],preferred:barn});const order=await create('work_orders',{equipment_id:equipment,title:'Inspeção',assignee:tech.email,due_on:today(),checklist:[{label:'Verificar',done:false}]});await call('POST','/api/orders/'+order.id+'/transition',{status:'assigned'});const payload={status:'in_progress',checklist:[{label:'Verificar',done:false}],report:'',duration_minutes:0};assert.equal((await call('POST','/api/staff/tasks/'+order.id,payload,operator)).status,403);assert.equal((await call('POST','/api/staff/tasks/'+order.id,payload,tech)).status,200);assert.equal((await call('POST','/api/staff/tasks/'+order.id,{...payload,status:'completed'},tech)).status,400);assert.equal((await call('POST','/api/staff/tasks/'+order.id,{...payload,status:'completed',checklist:[{label:'Alterado',done:true}],report:'OK'},tech)).status,400);assert.equal((await call('POST','/api/staff/tasks/'+order.id,{...payload,status:'completed',checklist:[{label:'Verificar',done:true}],report:'Conferido'},tech)).status,200);});
++test('CSV mapping preview rolls back, import is atomic and repeat is deduplicated',async()=>{source=(await integration()).id;const content=`galpao,data,ovos,aves\n${barn},2026-01-02,88,100`;let r=await call('POST',`/api/integrations/${source}/preview`,{content});assert.equal(r.status,200,JSON.stringify(r.body));assert.equal(r.body.accepted,1);assert.equal(await one(db,"SELECT id FROM production WHERE day='2026-01-02'"),null);r=await call('POST',`/api/integrations/${source}/import`,{content});assert.equal(r.body.accepted,1);assert.equal((await one(db,"SELECT source FROM production WHERE day='2026-01-02'")).source,'IMPORTED');assert.equal((await call('POST',`/api/integrations/${source}/import`,{content})).body.duplicates,1);const bad=`galpao,data,ovos,aves\n${barn},2026-01-03,89,100\n${randomUUID()},2026-01-04,50,100`;assert.equal((await call('POST',`/api/integrations/${source}/import`,{content:bad})).status,400);assert.equal(await one(db,"SELECT id FROM production WHERE day='2026-01-03'"),null);assert.equal((await call('GET',`/api/integrations/${source}/runs`,undefined,foreign)).status,404);});
++test('XLSX custom headers import and formulas fail without writes',async()=>{const s=await integration({format:'xlsx'});async function sheet(formula=false){const zip=new JSZip();zip.file('xl/worksheets/sheet1.xml',`<worksheet><sheetData><row><c r="A1" t="inlineStr"><is><t>galpao</t></is></c><c r="B1" t="inlineStr"><is><t>data</t></is></c><c r="C1" t="inlineStr"><is><t>ovos</t></is></c><c r="D1" t="inlineStr"><is><t>aves</t></is></c></row><row><c r="A2" t="inlineStr"><is><t>${barn}</t></is></c><c r="B2" t="inlineStr"><is><t>2026-01-05</t></is></c><c r="C2">${formula?'<f>1+1</f>':''}<v>80</v></c><c r="D2"><v>100</v></c></row></sheetData></worksheet>`);return zip.generateAsync({type:'base64'});}assert.equal((await call('POST',`/api/integrations/${s.id}/import`,{content:await sheet(true)})).status,400);assert.equal((await call('POST',`/api/integrations/${s.id}/import`,{content:await sheet()})).body.accepted,1);});
++test('API token scoped to one source and tenant, rotation revokes old credential',async()=>{const s=await integration({kind:'api'});apiToken=s.token;const body={rows:[{galpao:barn,data:'2026-01-06',ovos:91,aves:100}]};let r=await call('POST','/api/import-feed',body,null,{origin:undefined,authorization:'Bearer '+apiToken});assert.equal(r.status,200,JSON.stringify(r.body));assert.equal((await call('POST','/api/import-feed',{rows:[{galpao:randomUUID(),data:'2026-01-07',ovos:91,aves:100}]},null,{origin:undefined,authorization:'Bearer '+apiToken})).status,400);await call('POST','/api/integrations/'+s.id+'/token');assert.equal((await call('POST','/api/import-feed',body,null,{origin:undefined,authorization:'Bearer '+apiToken})).status,401);const listed=await call('GET','/api/integrations');assert.ok(!JSON.stringify(listed.body).includes(apiToken));});
++test('SSRF policy rejects private/reserved addresses, URL secrets and arbitrary hosts',async()=>{process.env.IMPORT_ALLOWED_HOSTS='exports.example.com,localhost';for(const ip of ['127.0.0.1','10.0.0.2','169.254.169.254','192.168.1.1','172.16.0.1','100.64.0.1','::1','198.18.0.1','203.0.113.1'])assert.equal(publicIPv4(ip),false,ip);assert.equal(publicIPv4('8.8.8.8'),true);for(const url of ['http://exports.example.com/a','https://evil.example/a','https://exports.example.com/a?token=x','https://a:b@exports.example.com/a','https://127.0.0.1/a'])assert.throws(()=>allowedEndpoint(url));assert.equal(allowedEndpoint('https://exports.example.com/data.csv').hostname,'exports.example.com');await assert.rejects(fetchSource('https://localhost/file',''),/IPv4 públicos/);});
++test('scheduled import advances next run, encrypts secret and excludes concurrent leases',async()=>{const s=await integration({kind:'https',endpoint:'https://exports.example.com/data.csv',secret:'very-private'});assert.notEqual((await one(db,'SELECT secret FROM integration_sources WHERE id=?',[s.id])).secret,'very-private');let calls=0;const fetch=async(url:string,secret:string)=>{calls++;assert.equal(secret,'very-private');return Buffer.from(`galpao,data,ovos,aves\n${barn},2026-01-08,95,100`);};await automationTick(db,{at:new Date(Date.now()+1000),fetch});await automationTick(db,{fetch});assert.equal(calls,1);assert.equal((await one(db,'SELECT last_status FROM integration_sources WHERE id=?',[s.id])).last_status,'completed');let release!:()=>void;const wait=new Promise<void>(r=>release=r),first=lease(db,'test-exclusive',async()=>{await wait;return 'first';});await new Promise(r=>setTimeout(r,5));assert.equal((await lease(db,'test-exclusive',async()=>{throw new Error('must not run');})).busy,true);release();assert.equal(await first,'first');});
++test('report recipients reject foreign companies and operators',async()=>{const body={name:'Resumo',frequency:'daily',weekday:1,send_time:'00:00',timezone:'America/Sao_Paulo',barn_ids:[barn],indicators:['production','energy','maintenance','attention'],recipient_ids:[foreign.id],active:1};assert.equal((await call('POST','/api/report-schedules',body)).status,400);assert.equal((await call('POST','/api/report-schedules',{...body,recipient_ids:[operator.id]})).status,400);const r=await call('POST','/api/report-schedules',{...body,recipient_ids:[owner.id]});assert.equal(r.status,200);schedule=r.body.id;assert.equal((await call('GET',`/api/report-schedules/${schedule}/preview`,undefined,foreign)).status,404);});
++test('executive report uses comparable periods, no data labels and selected scope',async()=>{const yesterday=new Date(Date.parse(today()+'T12:00:00Z')-86400000).toISOString().slice(0,10),previous=new Date(Date.parse(yesterday+'T12:00:00Z')-86400000).toISOString().slice(0,10);for(const [day,eggs]of [[yesterday,200],[previous,100]])await insert(db,'production',{id:randomUUID(),tenant_id:a,barn_id:barn,day,eggs,birds:200,source:'IMPORTED',created_at:at()});const s=await one(db,'SELECT * FROM report_schedules WHERE id=?',[schedule]);const r=await executiveReport(db,s);assert.ok(r.html.includes('100%'));assert.ok(r.html.includes('Sem dados'));assert.ok(r.html.includes('IMPORTED'));assert.ok(!r.html.includes('Segredo B'));assert.ok(!r.html.includes('Galpão não atribuído'));});
++test('schedule is idempotent per local date and concurrent invocations',async()=>{await Promise.all([scheduleReports(db),scheduleReports(db)]);assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM report_deliveries')).n),1);await scheduleReports(db);assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM report_deliveries')).n),1);assert.equal(localClock('America/Sao_Paulo',new Date('2026-10-20T01:00:00Z')).day,'2026-10-19');});
++test('delivery retries failures then sends HTML through local SMTP test server',async()=>{
++ await deliverReports(db,async()=>{throw new Error('SMTP unavailable');});let m=await one(db,'SELECT * FROM report_deliveries');assert.equal(m.status,'pending');assert.equal(m.attempts,1);let received='';
++ const server=createServer(socket=>{socket.write('220 localhost test SMTP\r\n');let buf='',inData=false;socket.on('data',chunk=>{buf+=chunk.toString();while(buf.includes('\r\n')){const index=buf.indexOf('\r\n'),line=buf.slice(0,index);buf=buf.slice(index+2);if(inData){if(line==='.'){inData=false;socket.write('250 stored\r\n');}else received+=line+'\n';}else if(/^EHLO|HELO/i.test(line))socket.write('250 localhost\r\n');else if(/^DATA/i.test(line)){inData=true;socket.write('354 send data\r\n');}else if(/^QUIT/i.test(line)){socket.end('221 bye\r\n');}else socket.write('250 OK\r\n');}});});
++ await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));const addr=server.address() as any;
++ const transport=nodemailer.createTransport({host:'127.0.0.1',port:addr.port,secure:false,ignoreTLS:true});
++ try{await deliverReports(db,message=>transport.sendMail({from:'test@example.invalid',...message}),new Date(Date.now()+3600000));assert.ok(received.includes('text/html'));assert.ok(received.includes(owner.email));assert.ok(!received.includes(foreign.email));m=await one(db,'SELECT * FROM report_deliveries');assert.equal(m.status,'sent');let again=0;await deliverReports(db,async()=>{again++;},new Date(Date.now()+3600000));assert.equal(again,0);}finally{transport.close();await new Promise<void>(resolve=>server.close(()=>resolve()));}
++});
++test('delivery revalidates recipient role immediately before sending',async()=>{const next=new Date(Date.now()+86400000);await scheduleReports(db,next);await update(db,'users',{active:0},'id=?',[owner.id]);let sent=0;await deliverReports(db,async()=>{sent++;},next);assert.equal(sent,0);assert.equal((await one(db,"SELECT status FROM report_deliveries WHERE status='cancelled'")).status,'cancelled');await update(db,'users',{active:1},'id=?',[owner.id]);});
++test('daily dashboard reports persisted staff/import records in same tables',async()=>{const r=await call('GET','/api/operations');assert.equal(r.status,200);assert.equal(r.body.barns.find((b:Row)=>b.id===barn).production_id!=null,true);const d=await call('GET',`/api/dashboard?from=${today()}&to=${today()}`);assert.equal(d.body.performance.eggs,81);});
++test('disabled integration cannot accept an API import and failed reprocessing stays atomic',async()=>{
++ const s=await integration({kind:'api'});await update(db,'integration_sources',{active:0},'id=?',[s.id]);assert.equal((await call('POST','/api/import-feed',{rows:[{galpao:barn,data:'2026-01-09',ovos:90,aves:100}]},null,{origin:undefined,authorization:'Bearer '+s.token})).status,401);
++ const failed=await one(db,"SELECT id FROM import_runs WHERE source_id=? AND status='failed' LIMIT 1",[source]);assert.ok(failed);assert.equal((await call('POST',`/api/integrations/${source}/retry/${failed.id}`)).status,400);assert.equal(await one(db,"SELECT id FROM production WHERE day='2026-01-03'"),null);
++});
++test('weekly schedules honor timezone, weekday and configured time',async()=>{
++ const s=await one(db,'SELECT * FROM report_schedules WHERE id=?',[schedule]);const weekly={...s,id:randomUUID(),frequency:'weekly',weekday:2,send_time:'07:00',last_slot:null};await insert(db,'report_schedules',weekly);await insert(db,'report_recipients',{tenant_id:a,schedule_id:weekly.id,user_id:owner.id});
++ await scheduleReports(db,new Date('2026-10-19T12:00:00Z'));await scheduleReports(db,new Date('2026-10-20T09:59:00Z'));assert.equal(await one(db,'SELECT id FROM report_deliveries WHERE schedule_id=?',[weekly.id]),null);
++ await scheduleReports(db,new Date('2026-10-20T10:00:00Z'));assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM report_deliveries WHERE schedule_id=?',[weekly.id])).n),1);
++});
++test('demo reports retain explicit simulated label and restricted indicators',async()=>{
++ await update(db,'tenants',{demo:1},'id=?',[a]);try{const s=await one(db,'SELECT * FROM report_schedules WHERE id=?',[schedule]);const r=await executiveReport(db,{...s,indicators:'["production"]'});assert.match(r.subject,/DEMONSTRAÇÃO/);assert.match(r.html,/TODOS OS DADOS SÃO FICTÍCIOS/);assert.ok(!r.html.includes('Custo estimado com tarifa'));}finally{await update(db,'tenants',{demo:0},'id=?',[a]);}
++});
+diff --git a/tests/browser-v2.mjs b/tests/browser-v2.mjs
+new file mode 100644
+index 0000000..b65edd2
+--- /dev/null
++++ b/tests/browser-v2.mjs
+@@ -0,0 +1,27 @@
++// Run locally after pnpm dev. This workflow intentionally changes only an isolated demo tenant.
++import {chromium} from 'playwright';
++import assert from 'node:assert/strict';
++import {randomBytes} from 'node:crypto';
++const base=process.env.E2E_BASE_URL||'http://localhost:3000';
++const browser=await chromium.launch();
++const manager=await browser.newContext({baseURL:base});
++const request=manager.request;
++async function post(path,body,csrf,method='POST'){const r=await request.fetch('/api'+path,{method,data:body,headers:{origin:base,...(csrf?{'x-csrf-token':csrf}:{})}});assert.ok(r.ok(),await r.text());return r.json();}
++let operator;
++try{
++ await post('/auth/demo',{});const me=await (await request.get('/api/auth/me')).json();assert.equal(me.tenant.demo,1,'E2E requires demo tenant');
++ const password=randomBytes(24).toString('hex'),email='e2e-'+Date.now()+'@example.invalid',csrf=me.csrf;
++ const unit=await post('/data/units',{name:'E2E automação',address:'Somente demonstração'},csrf);
++ const barn=await post('/data/barns',{name:'E2E galpão '+Date.now(),unit_id:unit.id,capacity:100,birds:80},csrf);
++ const equipment=await post('/data/equipment',{name:'Motor E2E',barn_id:barn.id,category:'Motor'},csrf);
++ operator=await post('/users',{name:'Operador E2E',email,password,role:'OPERATOR'},csrf);
++ await post('/staff/assignments/'+operator.id,{barn_ids:[barn.id],preferred:barn.id},csrf,'PUT');
++ const staff=await (await request.get('/api/staff')).json();await post('/population',{barn_id:barn.id,day:staff.today,birds:80},csrf);
++ const context=await browser.newContext({baseURL:base});const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));
++ await page.goto('/login');await page.getByLabel('E-mail',{exact:true}).fill(email);await page.getByLabel('Senha',{exact:true}).fill(password);await page.getByRole('button',{name:'Entrar na plataforma'}).click();await page.waitForURL('**/app/staff');
++ for(const width of [360,390,768,1024,1440]){await page.setViewportSize({width,height:900});await page.getByLabel('Quantidade de ovos').fill('70');await page.getByRole('button',{name:'Salvar produção'}).click();await page.getByRole('status').filter({hasText:'Produção registrada'}).waitFor();assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Horizontal overflow at '+width);}
++ await page.getByRole('button',{name:'Comunicar problema'}).click();await page.getByLabel('Equipamento',{exact:true}).selectOption(equipment.id);await page.getByLabel('Conte em poucas palavras').fill('Motor com ruído de teste');await page.getByRole('button',{name:'Registrar ocorrência',exact:true}).click();await page.getByRole('status').filter({hasText:'Ocorrência registrada'}).waitFor();
++ assert.equal((await context.request.get('/api/data/costs')).status(),403);
++ const adminPage=await manager.newPage();for(const width of [360,390,768,1024,1440]){await adminPage.setViewportSize({width,height:900});for(const path of ['team-operations','integrations','report-schedules']){await adminPage.goto('/app/'+path);await adminPage.getByRole('heading',{level:1}).waitFor();assert.ok(await adminPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),path+' overflow '+width);}}
++ assert.deepEqual(errors,[]);console.log('V2 employee and management browser checks passed. Reset demo to remove fixtures.');await context.close();
++}finally{if(operator){const me=await (await request.get('/api/auth/me')).json();await post('/users/'+operator.id+'/access',{active:0,role:'OPERATOR'},me.csrf).catch(()=>{});}await manager.close();await browser.close();}
+diff --git a/tests/core.test.ts b/tests/core.test.ts
+index 486a9d7..2d7b4c5 100644
+--- a/tests/core.test.ts
++++ b/tests/core.test.ts
+@@ -26,7 +26,7 @@ async function company(name:string){const id=randomUUID();await insert(db,'tenan
+ async function create(name:string,body:any){const r=await request('POST','/api/data/'+name,body);assert.equal(r.status,200,JSON.stringify(r.body));return r.body;}
+ before(async()=>{process.env.ENABLE_DEMO='true';process.env.MFA_ENCRYPTION_KEY=randomBytes(32).toString('hex');db=await connect({driver:process.env.TEST_DB_DRIVER||'sqlite',path:':memory:'});if(db.driver==='postgres'){const current=await one(db,'SELECT current_database() AS name');if(current.name!=='agro_test')throw new Error('Teste destrutivo permitido SOMENTE no banco agro_test.');await db.query('DROP SCHEMA public CASCADE');await db.query('CREATE SCHEMA public');}await migrate(db);await seedPlans(db);plan=(await one(db,"SELECT id FROM plans WHERE name='INTELLIGENCE'")).id;const d=await db.transaction(tx=>seedDemo(tx));demo=d.tenant_id;tenantA=await company('Tenant A');tenantB=await company('Tenant B');app=createApp(db);owner=await user(tenantA,'OWNER','owner@test.example');viewer=await user(tenantA,'VIEWER','viewer@test.example');});
+ after(async()=>db.close());
+-test('migration is repeatable',async()=>{await migrate(db);assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM schema_migrations')).n),1);});
++test('migration is repeatable',async()=>{await migrate(db);assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM schema_migrations')).n),2);});
+ test('password hashing and wrong password',()=>{const p=passwordHash(password);assert.equal(passwordCheck(password,p),true);assert.equal(passwordCheck('wrong',p),false);assert.notEqual(p,passwordHash(password));});
+ test('RFC 6238 SHA1 vector, encryption and replay protection',()=>{const secret=base32(Buffer.from('12345678901234567890'));assert.equal(totp(secret,1),'287082');assert.equal(verifyTotp(secret,'287082',-1,59000),1);assert.equal(verifyTotp(secret,'287082',1,59000),null);assert.equal(decryptSecret(encryptSecret(secret)),secret);});
+ test('authentication and invalid credentials',async()=>{assert.equal((await request('GET','/api/dashboard',undefined,null)).status,401);assert.equal((await request('POST','/api/auth/login',{email:'owner@test.example',password:'invalid'},null)).status,401);});
+diff --git a/tests/transport-migration.test.ts b/tests/transport-migration.test.ts
+new file mode 100644
+index 0000000..92a40c9
+--- /dev/null
++++ b/tests/transport-migration.test.ts
+@@ -0,0 +1,28 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFileSync} from 'node:fs';
++import {connect,one,insert} from '../packages/database/db.ts';
++import {migrate} from '../packages/database/migrate.ts';
++import {fastifyTransport} from '../apps/api/src/fastify-transport.ts';
++import {seedDemo} from '../scripts/seed.ts';
++
++test('002 upgrades populated 001 without rewriting users, sessions or production',async()=>{
++ const db=await connect({driver:'sqlite',path:':memory:'});try{
++ const initial=readFileSync(new URL('../packages/database/migrations/001_initial.sql',import.meta.url),'utf8');
++ for(const sql of initial.split(';').map(s=>s.trim()).filter(Boolean))await db.query(sql);
++ await insert(db,'schema_migrations',{version:'001',applied_at:new Date().toISOString()});
++ await seedDemo(db);const user=await one(db,'SELECT id,password_hash FROM users LIMIT 1');await insert(db,'sessions',{id:'fixture-session',user_id:user.id,csrf:'fixture',expires_at:'2099-01-01',created_at:'2026-01-01'});
++ const count=await one(db,'SELECT COUNT(*) AS n FROM production');await migrate(db);await migrate(db);
++ assert.equal((await one(db,'SELECT COUNT(*) AS n FROM production')).n,count.n);assert.equal((await one(db,'SELECT password_hash FROM users WHERE id=?',[user.id])).password_hash,user.password_hash);assert.equal((await one(db,"SELECT id FROM sessions WHERE id='fixture-session'")).id,'fixture-session');assert.equal(Number((await one(db,'SELECT COUNT(*) AS n FROM schema_migrations')).n),2);
++ }finally{await db.close();}
++});
++test('Fastify real HTTP serves demo, enforces CSRF, restricts staff and returns binary PDF',async()=>{
++ process.env.ENABLE_DEMO='true';process.env.APP_ORIGIN='http://localhost:3000';const db=await connect({driver:'sqlite',path:':memory:'});await migrate(db);await seedDemo(db);const server=await fastifyTransport(db);try{
++ const base=await server.listen({host:'127.0.0.1',port:0});assert.equal((await fetch(base+'/api/health')).status,200);
++ const login=await fetch(base+'/api/auth/demo',{method:'POST',headers:{origin:'http://localhost:3000'}});assert.equal(login.status,200);const cookie=login.headers.get('set-cookie')!.split(';')[0];
++ const me=await fetch(base+'/api/auth/me',{headers:{cookie}});assert.equal(me.status,200);
++ const invalid=await fetch(base+'/api/staff/production',{method:'POST',headers:{cookie,origin:'http://localhost:3000','content-type':'application/json'},body:'{}'});assert.equal(invalid.status,403);
++ const pdf=await fetch(base+'/api/report.pdf',{headers:{cookie}});assert.equal(pdf.status,200);assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0,5).toString(),'%PDF-');
++ const unauth=await fetch(base+'/api/staff');assert.equal(unauth.status,401);
++ }finally{await server.close();await db.close();}
++});
+-- 
+2.51.1
+

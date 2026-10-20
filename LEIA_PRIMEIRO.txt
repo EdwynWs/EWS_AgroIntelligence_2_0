@@ -1,0 +1,5 @@
+EWS AgroIntelligence 2.0
+
+O codigo completo esta em ews-agrointelligence/. Comece por README.md e docs/ATUALIZACAO_2_0.md. Preserve seu .env e banco existente; nao apague .data. A pasta commits/ contem os patches para revisao ou uso em um clone na base 8f0e198; o codigo deste ZIP ja inclui essas alteracoes, portanto nao reaplique os patches nele.
+
+O push ao GitHub foi bloqueado pela revisao automatica e depende de autorizacao explicita. Nao houve deploy nem merge.

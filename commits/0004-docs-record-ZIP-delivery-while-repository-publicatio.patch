@@ -1,0 +1,39 @@
+From 0089cbf8a9a93caf739f96fc99f51dca8cea8d73 Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 05:39:31 +0200
+Subject: [PATCH 4/4] docs: record ZIP delivery while repository publication
+ awaits approval
+
+---
+ docs/ATUALIZACAO_2_0.md | 2 +-
+ docs/ENTREGA_2_0.md     | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/docs/ATUALIZACAO_2_0.md b/docs/ATUALIZACAO_2_0.md
+index 089639a..99bfdbc 100644
+--- a/docs/ATUALIZACAO_2_0.md
++++ b/docs/ATUALIZACAO_2_0.md
+@@ -5,7 +5,7 @@ Esta atualização reduz digitação em três frentes: Modo Funcionário, reapro
+ ## Atualizar a instalação existente
+ 
+ 1. Pare frontend, API e worker. Faça backup do banco e guarde a chave MFA existente. Não substitua `.env` nem apague `.data`.
+-2. Obtenha a branch `feat/automacao-operacional-v2` e confira as alterações locais antes de trocar de branch.
++2. Use o ZIP da atualização em uma pasta nova, preservando o `.env` e o banco da sua instalação. Confira diferenças antes de substituir seus arquivos. A branch `feat/automacao-operacional-v2` existe localmente no trabalho de desenvolvimento; o push está aguardando autorização após bloqueio da revisão automática.
+ 3. Com Node 24 e pnpm 11.25.0, na raiz:
+ 
+ ```bash
+diff --git a/docs/ENTREGA_2_0.md b/docs/ENTREGA_2_0.md
+index bfc8303..3b94bb2 100644
+--- a/docs/ENTREGA_2_0.md
++++ b/docs/ENTREGA_2_0.md
+@@ -1,6 +1,6 @@
+ # Entrega da atualização 2.0
+ 
+-Base: commit `8f0e198d9d63224edf5f0f43e2a9aaad19132a52` do repositório oficial. Branch: `feat/automacao-operacional-v2`. Não houve merge em main nem implantação em produção.
++Base: commit `8f0e198d9d63224edf5f0f43e2a9aaad19132a52` do repositório oficial. Branch local: `feat/automacao-operacional-v2`. O push foi bloqueado pela revisão automática por exigir autorização explícita de publicação; a branch ainda não foi enviada ao GitHub. O ZIP é a alternativa de entrega. Não houve merge em main nem implantação em produção.
+ 
+ ## Implementado
+ 
+-- 
+2.51.1
+
